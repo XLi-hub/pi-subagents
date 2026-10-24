@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
-import { checkPidLiveness, reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
+import { checkPidLiveness, checkRecordedPidLiveness, reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { summarizeAsyncStatus } from "../../src/runs/background/async-status.ts";
 
 function tempRoot(prefix: string): string {
@@ -32,6 +32,102 @@ describe("async stale-run reconciliation", () => {
 		assert.equal(checkPidLiveness(123, () => { throw errno("ESRCH"); }), "dead");
 		assert.equal(checkPidLiveness(123, () => { throw errno("EPERM"); }), "unknown");
 		assert.equal(checkPidLiveness(123, () => { throw new Error("boom"); }), "unknown");
+	});
+
+	it("treats a pid saved under another boot as dead without probing, only when the pid namespaces are comparable", () => {
+		const noProbe = () => { throw new Error("the pid must not be probed"); };
+		const alive = () => true;
+		const cases = [
+			{ name: "other boot, same scope", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-b" }, kill: noProbe, expected: "dead" },
+			{ name: "other boot, neither has a scope", recorded: { bootId: "boot-a" }, observed: { observedScope: undefined, observedBootId: "boot-b" }, kill: noProbe, expected: "dead" },
+			{ name: "other boot, record scope differs", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[2]", observedBootId: "boot-b" }, kill: () => { throw errno("ESRCH"); }, expected: "unknown" },
+			{ name: "other boot, only the observer has a scope", recorded: { bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-b" }, kill: alive, expected: "alive" },
+			{ name: "same boot, live pid", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-a" }, kill: alive, expected: "alive" },
+			{ name: "record has no boot id", recorded: { pidNamespaceScope: "pid:[1]" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-b" }, kill: alive, expected: "alive" },
+			{ name: "observer has no boot id", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: undefined }, kill: alive, expected: "alive" },
+		];
+		for (const testCase of cases) {
+			assert.equal(checkRecordedPidLiveness({ pid: 4242, ...testCase.recorded }, { ...testCase.observed, kill: testCase.kill }), testCase.expected, testCase.name);
+		}
+	});
+
+	it("marks a workflow whose Pi process is dead owner-exited, and no other repair", () => {
+		const root = tempRoot("pi-stale-run-owner-exited-");
+		try {
+			const resultsDir = path.join(root, "results");
+			const workflowStatus = (runId: string, extra: Record<string, unknown> = {}) => ({
+				runId,
+				sessionId: "session-owner",
+				mode: "workflow",
+				state: "running",
+				pid: 4242,
+				pidNamespaceScope: "pid:[same]",
+				bootId: "boot-now",
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "echo", status: "running", startedAt: 1000, workflowKey: "stage2" }],
+				workflow: { trace: [], emits: [], console: [], scriptDigest: "digest" },
+				...extra,
+			});
+			const reconcile = (runId: string, status: Record<string, unknown>, options: Parameters<typeof reconcileAsyncRun>[1]) => {
+				const asyncDir = path.join(root, runId);
+				writeStatus(asyncDir, status);
+				const result = reconcileAsyncRun(asyncDir, { resultsDir, pidNamespaceScope: () => "pid:[same]", bootId: () => "boot-now", now: () => 2000, ...options });
+				return { result, status: JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) };
+			};
+			const ownerExitedMessage = (runId: string) => `The Pi process (PID 4242) that ran workflow ${runId} exited before the workflow finished. Marked run failed by stale-run reconciliation. Its finished children are kept.`;
+
+			const dead = reconcile("wf-dead", workflowStatus("wf-dead"), { kill: () => { throw errno("ESRCH"); } });
+			assert.equal(dead.result.repaired, true);
+			assert.equal(dead.status.state, "failed");
+			assert.equal(dead.status.workflow.stopCause, "owner-exited");
+			assert.equal(dead.status.workflow.scriptDigest, "digest");
+			// When the dead owner last updated it, not the repair time, and the stop cause in the result.
+			assert.equal(dead.status.workflow.ownerExitedAt, 1000);
+			assert.equal(dead.status.endedAt, 2000);
+			assert.deepEqual(JSON.parse(fs.readFileSync(path.join(resultsDir, "wf-dead.json"), "utf-8")).workflow, { stopCause: "owner-exited" });
+			const neverUpdated = reconcile("wf-never-updated", workflowStatus("wf-never-updated", { lastUpdate: undefined, startedAt: 900 }), { kill: () => { throw errno("ESRCH"); } });
+			assert.equal(neverUpdated.status.workflow.ownerExitedAt, 900);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(resultsDir, "wf-dead.json"), "utf-8")).summary, ownerExitedMessage("wf-dead"));
+
+			const rebooted = reconcile("wf-rebooted", workflowStatus("wf-rebooted", { bootId: "boot-before" }), { kill: () => { throw new Error("the pid must not be probed"); } });
+			assert.equal(rebooted.status.workflow.stopCause, "owner-exited");
+
+			const alive = reconcile("wf-alive", workflowStatus("wf-alive"), { kill: () => true });
+			assert.equal(alive.result.repaired, false);
+			assert.equal(alive.status.workflow.stopCause, undefined);
+
+			const staleAlive = reconcile("wf-stale-alive", workflowStatus("wf-stale-alive"), { kill: () => true, staleAlivePidMs: 500 });
+			assert.equal(staleAlive.status.state, "failed");
+			assert.equal(staleAlive.status.workflow.stopCause, undefined);
+			assert.match(staleAlive.result.message ?? "", /^Async runner PID 4242 is still live; status has not updated/);
+
+			const staleUnknown = reconcile("wf-stale-unknown", workflowStatus("wf-stale-unknown", { pidNamespaceScope: "pid:[container]" }), { kill: () => { throw errno("ESRCH"); }, staleAlivePidMs: 500 });
+			assert.equal(staleUnknown.status.state, "failed");
+			assert.equal(staleUnknown.status.workflow.stopCause, undefined);
+			assert.match(staleUnknown.result.message ?? "", /cannot be probed from this process/);
+
+			const { workflow: _workflow, ...singleStatus } = workflowStatus("single-dead", { mode: "single" });
+			const single = reconcile("single-dead", singleStatus, { kill: () => { throw errno("ESRCH"); } });
+			assert.equal(single.status.workflow, undefined);
+			assert.equal(single.result.message, "Async runner process 4242 exited or disappeared before writing a result. Marked run failed by stale-run reconciliation.");
+
+			// An owning session's repair adopts its completion owner, so it can deliver the notice; only an owner-exited workflow does.
+			const deadPid = () => { throw errno("ESRCH"); };
+			const resultOwner = (runId: string) => JSON.parse(fs.readFileSync(path.join(resultsDir, `${runId}.json`), "utf-8")).completionOwnerId;
+			const adopted = reconcile("wf-adopted", workflowStatus("wf-adopted", { completionOwnerId: "dead-process" }), { kill: deadPid, adoptCompletionOwnerId: "this-process" });
+			assert.equal(adopted.status.completionOwnerId, "this-process");
+			assert.equal(resultOwner("wf-adopted"), "this-process");
+			// A repair where no owning session adopts it leaves its notice to whichever session owns the run.
+			const elsewhere = reconcile("wf-elsewhere", workflowStatus("wf-elsewhere", { completionOwnerId: "dead-process" }), { kill: deadPid });
+			assert.equal(elsewhere.status.completionOwnerId, "owning-session");
+			assert.equal(resultOwner("wf-elsewhere"), "owning-session");
+			const singleKept = reconcile("single-kept", { ...singleStatus, runId: "single-kept", completionOwnerId: "dead-process" }, { kill: deadPid, adoptCompletionOwnerId: "this-process" });
+			assert.equal(singleKept.status.completionOwnerId, "dead-process");
+			assert.equal(resultOwner("single-kept"), "dead-process");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("repairs a recent Linux zombie only with a verified PID namespace", { skip: process.platform !== "linux", timeout: 10_000 }, async () => {
@@ -182,6 +278,7 @@ describe("async stale-run reconciliation", () => {
 				runId: "run-dead",
 				sessionId: "session-current",
 				completionOwnerId: "owner-current",
+				completionOwnerProcess: { pid: 4321, bootId: "boot-a" },
 				mode: "single",
 				state: "running",
 				pid: 12345,
@@ -213,6 +310,7 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(resultJson.success, false);
 			assert.equal(resultJson.sessionId, "session-current");
 			assert.equal(resultJson.completionOwnerId, "owner-current");
+			assert.deepEqual(resultJson.completionOwnerProcess, { pid: 4321, bootId: "boot-a" });
 			assert.equal(resultJson.state, "failed");
 			assert.equal(resultJson.exitCode, 1);
 			assert.equal(resultJson.results[0].contextOverflow, true);
