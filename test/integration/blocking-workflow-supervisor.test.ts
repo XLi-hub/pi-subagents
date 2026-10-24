@@ -98,8 +98,8 @@ describe("supervisor asks in blocking workflows", { skip: !available }, () => {
 				controller.abort();
 				channel.dispose();
 				setChildSessionFactoryModule(fileURLToPath(new URL("../support/runner-child-session-factory.ts", import.meta.url)));
-				for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
-				for (const childId of childIds) fs.rmSync(path.join(ASYNC_DIR, childId), { recursive: true, force: true });
+				for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+				for (const childId of childIds) fs.rmSync(path.join(ASYNC_DIR, childId), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 			}
 		});
 	}
