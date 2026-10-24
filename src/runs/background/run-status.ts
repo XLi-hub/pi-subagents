@@ -176,6 +176,15 @@ function runStatusStepDisplayName(step: { agent: string; sessionName?: string; l
 	return step.sessionName?.trim() || (step.label ? `${step.label} (${step.agent})` : step.agent);
 }
 
+function storedWorktreeOverlapStatus(value: unknown, asyncDir: string): string | undefined {
+	if (value === undefined) return undefined;
+	const report = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+	const summary = report?.version === 1 && (report.state === "complete" || report.state === "incomplete") && Array.isArray(report.overlaps) && Array.isArray(report.reviewGroups)
+		? `${report.state}, ${report.overlaps.length} shared path(s), ${report.reviewGroups.length} review group(s)`
+		: "stored analysis is unavailable";
+	return `Worktree file overlaps: ${summary}. Full report: ${path.join(asyncDir, "status.json")} (workflow.worktreeOverlaps)`;
+}
+
 function nestedRunDisplayName(run: NestedRunSummary): string {
 	if (run.sessionName?.trim()) return run.sessionName.trim();
 	if (run.agent) return run.agent;
@@ -606,6 +615,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				status.parentWorkflowRunId ? `Workflow parent: ${status.parentWorkflowRunId}${status.workflowKey ? ` (${status.workflowKey})` : ""}` : undefined,
 				status.mode === "workflow" && workflowReturnPreview !== undefined ? `Return: ${workflowReturnPreview}` : undefined,
 				status.mode === "workflow" && workflowEmitPreview !== undefined ? `Latest emit: ${workflowEmitPreview}` : undefined,
+				storedWorktreeOverlapStatus(status.workflow?.worktreeOverlaps, asyncDir),
 				status.mode === "workflow" && (workflowReturnPreview?.endsWith("…") || workflowEmitPreview?.endsWith("…")) ? `Full return value and emits: ${path.join(asyncDir, "status.json")} (workflow.value, workflow.emits)` : undefined,
 				`Progress: ${progressLabel}`,
 				...(status.mode === "workflow" ? formatWorkflowChecklistText(projectWorkflowChecklist({

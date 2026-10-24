@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import { analyzeWorktreeOverlaps, formatWorktreeOverlaps } from "../../src/workflows/worktree-overlaps.ts";
 import type { WorkflowScriptChildResult } from "../../src/workflows/scripted-workflow.ts";
 import type { ParallelHandoffManifest } from "../../src/shared/types.ts";
+import { readParallelHandoffManifest } from "../../src/runs/shared/parallel-handoff.ts";
 
 function fixture(t: { after: (fn: () => void) => void }) {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-overlaps-"));
@@ -67,7 +68,8 @@ describe("workflow worktree overlap analysis", () => {
 		assert.equal(report.state, "incomplete");
 		assert.equal(report.overlaps.length, 1);
 		assert.equal(report.children.filter((row) => row.paths === undefined).length, 2);
-		assert.match(formatWorktreeOverlaps(report), /2 unexamined child patch/);
+		assert.match(formatWorktreeOverlaps(report), /Unexamined "unknown": Handoff has no complete changed-path inventory/);
+		assert.match(formatWorktreeOverlaps(report), /Unexamined "missing": Handoff is missing/);
 		const incomplete = analyzeWorktreeOverlaps([child("valid", ["one.ts"]), missing])!;
 		assert.match(formatWorktreeOverlaps(incomplete), /remaining children are unexamined/);
 		assert.doesNotMatch(formatWorktreeOverlaps(incomplete), /No shared file paths found in the captured patches/);
@@ -127,5 +129,68 @@ describe("workflow worktree overlap analysis", () => {
 		const text = formatWorktreeOverlaps(analyzeWorktreeOverlaps([child("a", paths), child("b", paths)]));
 		assert.ok(text.length <= 6_000);
 		assert.match(text, /summary truncated/);
+	});
+
+	it("forms transitive review groups while keeping disjoint and unexamined patches separate", (t) => {
+		const { dir, child } = fixture(t);
+		const report = analyzeWorktreeOverlaps([
+			child("api", ["api.ts", "types.ts"]),
+			child("ui", ["types.ts", "styles.css"]),
+			child("theme", ["styles.css"]),
+			child("db", ["schema.sql"]),
+			child("migration", ["schema.sql"]),
+			child("tests", ["api.test.ts"]),
+			child("unknown", undefined),
+		])!;
+		assert.deepEqual(report.reviewGroups, [
+			{ children: ["api", "ui", "theme"], sharedPaths: [{ repoRoot: dir, path: "styles.css" }, { repoRoot: dir, path: "types.ts" }] },
+			{ children: ["db", "migration"], sharedPaths: [{ repoRoot: dir, path: "schema.sql" }] },
+		]);
+		assert.deepEqual(report.disjointChildren, ["tests"]);
+		assert.match(formatWorktreeOverlaps(report), /6\/7 child patch inventories examined; 1 with no shared paths/);
+		assert.match(formatWorktreeOverlaps(report), /"api", "ui", "theme"/);
+	});
+
+	it("includes per-child file previews and references even when no files overlap", (t) => {
+		const { child } = fixture(t);
+		const report = analyzeWorktreeOverlaps([child("api", ["api.ts"]), child("ui", ["ui.tsx"])])!;
+		assert.deepEqual(report.reviewGroups, []);
+		assert.deepEqual(report.disjointChildren, ["api", "ui"]);
+		const text = formatWorktreeOverlaps(report);
+		assert.match(text, /Changes "api" \(1 path\(s\)\): "api.ts"/);
+		assert.match(text, /Changes "ui" \(1 path\(s\)\): "ui.tsx"/);
+		assert.match(text, /api.patch/);
+		assert.match(text, /ui.patch/);
+	});
+
+	it("keeps missing evidence visible before a truncated list of shared files", (t) => {
+		const { child } = fixture(t);
+		const paths = Array.from({ length: 12 }, (_, i) => `${i}-${"a".repeat(1_000)}.ts`);
+		const report = analyzeWorktreeOverlaps([child("a", paths), child("b", paths), child("unknown", undefined)])!;
+		const text = formatWorktreeOverlaps(report);
+		assert.match(text, /analysis: incomplete/);
+		assert.match(text, /Unexamined "unknown": Handoff has no complete changed-path inventory/);
+		assert.match(text, /summary truncated/);
+		assert.ok(text.indexOf("Unexamined") < text.indexOf("Review together"));
+	});
+
+	it("bounds the actual handoff read and accepts inventories exactly at the byte limit", (t) => {
+		const { child } = fixture(t);
+		const value = child("api", ["文件.ts"]);
+		const file = value.worktreeHandoff!.path;
+		const bytes = fs.statSync(file).size;
+		assert.deepEqual(readParallelHandoffManifest(file, bytes)?.groups[0]?.children[0]?.patch.paths, ["文件.ts"]);
+		assert.throws(() => readParallelHandoffManifest(file, bytes - 1), /read limit/);
+		assert.throws(() => readParallelHandoffManifest(file, 0), /Invalid parallel handoff read limit/);
+	});
+
+	it("counts isolated children that returned no handoff instead of omitting their missing evidence", (t) => {
+		const { child } = fixture(t);
+		const failed: WorkflowScriptChildResult = { key: "setup-failed", worktreeRequested: true, ok: false, output: "Setup failed", artifactPaths: [] };
+		const report = analyzeWorktreeOverlaps([child("api", ["api.ts"]), failed])!;
+		assert.equal(report.state, "incomplete");
+		assert.equal(report.children.length, 2);
+		assert.equal(report.children[1]?.handoffPath, undefined);
+		assert.match(formatWorktreeOverlaps(report), /Unexamined "setup-failed": Isolated child returned no worktree handoff/);
 	});
 });

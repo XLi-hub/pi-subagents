@@ -1138,6 +1138,8 @@ export interface WorkflowScriptChildResult {
 	outputArtifactPath?: string;
 	/** Explicit host-produced worktree evidence, used once when the workflow settles. */
 	worktreeHandoff?: import("../shared/types.ts").ParallelHandoffReference;
+	/** Known isolation intent, retained even if launch/setup returned no handoff. */
+	worktreeRequested?: true;
 	recovery?: AcceptanceRecoveryMetadata;
 	outputPathMapping?: { requestedPath: string; savedPath: string };
 	externalAdapter?: import("../shared/types.ts").ExternalCliReceiptMetadata;

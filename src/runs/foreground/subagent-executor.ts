@@ -4769,6 +4769,7 @@ function workflowChildResult(
 		...(outputReference ? { outputReference } : {}),
 		...(outputArtifactPath ? { outputArtifactPath } : {}),
 		...(result.details.parallelHandoff ? { worktreeHandoff: result.details.parallelHandoff } : {}),
+		...(childParams.worktree === true ? { worktreeRequested: true } : {}),
 		...(acceptanceRecovery ? { recovery: acceptanceRecovery } : {}),
 		...(outputPathMapping ? { outputPathMapping } : {}),
 		...(externalAdapter ? { externalAdapter } : {}),
