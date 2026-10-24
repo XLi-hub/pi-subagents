@@ -158,7 +158,8 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 
 	for (const reason of ["need_decision", "interview_request", "successful_reply"] as const) {
 		it(`preserves ${reason} through the shared Herdr/Rex supervisor file relay and bridge`, { timeout: 10_000 }, async () => {
-			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-supervisor-relay-"));
+			// Short prefix: the bridge socket lives under this dir, and macOS caps Unix socket paths at 104 bytes.
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psr-"));
 			const bridgeDir = path.join(dir, "bridge"), supervisorDir = path.join(dir, "supervisor");
 			fs.mkdirSync(bridgeDir);
 			fs.mkdirSync(path.join(supervisorDir, "requests"), { recursive: true });
