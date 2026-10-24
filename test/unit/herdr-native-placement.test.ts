@@ -149,6 +149,61 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		finally { socket?.destroy(); handlers.get("session_shutdown")?.(); old.mode === undefined ? delete process.env[HERDR_PI_MODE_ENV] : process.env[HERDR_PI_MODE_ENV] = old.mode; old.run === undefined ? delete process.env[HERDR_PI_RUN_ENV] : process.env[HERDR_PI_RUN_ENV] = old.run; old.dir === undefined ? delete process.env[HERDR_PI_RUNTIME_DIR_ENV] : process.env[HERDR_PI_RUNTIME_DIR_ENV] = old.dir; fs.rmSync(dir, { recursive: true, force: true }); }
 	});
 
+	for (const reason of ["need_decision", "interview_request", "successful_reply"] as const) {
+		it(`preserves ${reason} through the shared Herdr/Rex supervisor file relay and bridge`, { timeout: 10_000 }, async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-supervisor-relay-"));
+			const bridgeDir = path.join(dir, "bridge"), supervisorDir = path.join(dir, "supervisor");
+			fs.mkdirSync(bridgeDir);
+			fs.mkdirSync(path.join(supervisorDir, "requests"), { recursive: true });
+			fs.mkdirSync(path.join(supervisorDir, "replies"));
+			const saved = { mode: process.env[HERDR_PI_MODE_ENV], run: process.env[HERDR_PI_RUN_ENV], dir: process.env[HERDR_PI_RUNTIME_DIR_ENV] };
+			const runId = "run_relay123";
+			process.env[HERDR_PI_MODE_ENV] = "1";
+			process.env[HERDR_PI_RUN_ENV] = runId;
+			process.env[HERDR_PI_RUNTIME_DIR_ENV] = bridgeDir;
+			const handlers = new Map<string, Function>();
+			let tool: any, command: any, session: HerdrPiSession | undefined, bridge: BridgeChannel | undefined;
+			const pi = { registerTool(value: unknown) { tool = value; }, registerCommand(_name: string, value: unknown) { command = value; }, on(name: string, handler: Function) { handlers.set(name, handler); }, getActiveTools: () => ["read"], setActiveTools() {} };
+			try {
+				registerHerdrPiBridge(pi as never);
+				const ctx = { sessionManager: { getSessionId: () => "native", getSessionFile: () => "/remote/session" }, model: { provider: "p", id: "m" }, isIdle: () => true, hasPendingMessages: () => false };
+				handlers.get("session_start")?.({}, ctx);
+				bridge = new BridgeChannel(path.join(bridgeDir, "bridge.sock"), runId);
+				await bridge.configure({ agent: "worker", toolCeiling: ["read"] });
+				const identity: HerdrRunIdentity = { runId, machineId: "m1", target: "remote", session: null, workspaceId: "w", tabId: "t", paneId: "p", terminalId: "term", agentName: "pi-relay", nativeSessionId: "native", cwd: process.cwd(), runtimeDir: bridgeDir };
+				const owner = { identity, machine, connection: {}, async cleanup() {} } as unknown as HerdrPlacedRunOwner;
+				const host = { async prompt(_connection: unknown, _identity: unknown, text: string) { await command.handler(text.slice("/pi-subagents-bridge ".length), ctx); } };
+				session = new HerdrPiSession(owner, { async close() {} }, bridge, ["read"], "p/m", { ...runtime, runId, supervisorChannelDir: supervisorDir, orchestratorSessionId: "parent" }, undefined, host as never);
+				const requested = new Promise<{ requestId: string }>((resolve) => {
+					bridge!.listeners.add((frame) => { if (frame.type === "supervisor-request") resolve(frame as { requestId: string }); });
+				});
+				// Attach both handlers before sending a response, including the expected tool rejection.
+				const outcome = tool.execute("ask", { reason: reason === "interview_request" ? reason : "need_decision", message: "Choose an approach" })
+					.then((value: any) => ({ value }), (error: Error) => ({ error }));
+				const { requestId } = await requested;
+				assert.ok(fs.existsSync(path.join(supervisorDir, "requests", `${requestId}.json`)), "the remote ask must reach the parent's file mailbox");
+				const error = "Supervisor unavailable: the parent is blocked in an async:false workflow. Report the blocker and partial results, then stop.";
+				fs.writeFileSync(path.join(supervisorDir, "replies", `${requestId}.json`), JSON.stringify({ type: "subagent.supervisor.reply", requestId, createdAt: Date.now(), message: reason === "successful_reply" ? "Proceed with approach A" : "", ...(reason === "successful_reply" ? {} : { error }) }));
+				const result = await outcome;
+				if (reason === "successful_reply") {
+					assert.equal(result.error, undefined);
+					assert.match(result.value.content[0].text, /Reply from supervisor:\*\*\nProceed with approach A/);
+				} else {
+					assert.equal(result.value, undefined, "a transport failure must not become a successful empty reply");
+					assert.equal(result.error?.message, error);
+				}
+			} finally {
+				await session?.dispose();
+				bridge?.close();
+				handlers.get("session_shutdown")?.();
+				if (saved.mode === undefined) delete process.env[HERDR_PI_MODE_ENV]; else process.env[HERDR_PI_MODE_ENV] = saved.mode;
+				if (saved.run === undefined) delete process.env[HERDR_PI_RUN_ENV]; else process.env[HERDR_PI_RUN_ENV] = saved.run;
+				if (saved.dir === undefined) delete process.env[HERDR_PI_RUNTIME_DIR_ENV]; else process.env[HERDR_PI_RUNTIME_DIR_ENV] = saved.dir;
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	}
+
 	it("leaves the remote operator's APPEND_SYSTEM.md out of the child's prompt", { skip: process.platform === "win32" }, async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-herdr-append-")); const old = { mode: process.env[HERDR_PI_MODE_ENV], run: process.env[HERDR_PI_RUN_ENV], dir: process.env[HERDR_PI_RUNTIME_DIR_ENV] }; process.env[HERDR_PI_MODE_ENV] = "1"; process.env[HERDR_PI_RUN_ENV] = "run_append01"; process.env[HERDR_PI_RUNTIME_DIR_ENV] = dir; const handlers = new Map<string, Function>(); let socket: net.Socket | undefined;
 		const pi = { registerTool() {}, registerCommand() {}, on(name: string, handler: Function) { handlers.set(name, handler); }, getActiveTools: () => ["read"], setActiveTools() {} };
