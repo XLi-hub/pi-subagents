@@ -854,6 +854,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".base-commit"] }));
 			assert.equal(diffs.length, 1);
 			assert.equal(diffs[0]!.agent, "agent-a");
 			assert.equal(diffs[0]!.filesChanged, 3, `expected 3 files, got ${diffs[0]!.filesChanged}`);
+			assert.deepEqual(diffs[0]!.paths, ["committed.ts", "new-file.ts", "tracked.txt"]);
 			assert.ok(diffs[0]!.insertions > 0, "expected insertions > 0");
 			assert.ok(fs.existsSync(diffs[0]!.patchPath), "expected patch file to exist");
 
@@ -910,9 +911,30 @@ process.stdout.write("corrupt external diff output\\n");
 
 			const diffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "binary"));
 			assert.equal(diffs[0]?.error, undefined);
+			assert.deepEqual(diffs[0]?.paths, ["binary.dat"]);
 			const patch = fs.readFileSync(diffs[0]!.patchPath, "utf-8");
 			assert.match(patch, /GIT binary patch/);
 			assert.equal(git(worktree.path, ["apply", "--check", "--cached", "--reverse", diffs[0]!.patchPath]), "");
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("captures rename sources and destinations and literal unusual filenames", async () => {
+		const repoDir = createRepo("pi-worktree-paths-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			git(repoDir, ["config", "diff.renames", "true"]);
+			setup = await createWorktrees(repoDir, "changed-paths", 1);
+			const worktree = setup.worktrees[0]!;
+			fs.renameSync(path.join(worktree.path, "tracked.txt"), path.join(worktree.path, "renamed.txt"));
+			const names = process.platform === "win32" ? ["空 格.ts"] : ["空 格.ts", "tab\tname.ts", "line\nname.ts"];
+			for (const name of names) fs.writeFileSync(path.join(worktree.path, name), "new\n");
+			const [diff] = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "paths"));
+			assert.equal(diff?.error, undefined);
+			assert.equal(diff?.filesChanged, names.length + 1);
+			assert.deepEqual(diff?.paths, [...names, "tracked.txt", "renamed.txt"].sort());
 		} finally {
 			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
 			cleanupRepo(repoDir);

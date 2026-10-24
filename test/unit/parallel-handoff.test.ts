@@ -31,6 +31,7 @@ function diff(dir: string, index: number, agent: string, changed: boolean): Work
 		filesChanged: changed ? 1 : 0,
 		insertions: changed ? 1 : 0,
 		deletions: 0,
+		paths: changed ? ["a"] : [],
 		patchPath,
 	};
 }
@@ -146,6 +147,7 @@ describe("parallel handoff", () => {
 			assert.equal(manifest.groups[1]!.children[0]!.index, 3);
 			assert.deepEqual(manifest.groups[1]!.children[0]!.structuredOutput, { ok: true });
 			assert.equal(manifest.groups[1]!.children[0]!.patch.changed, true);
+			assert.deepEqual(manifest.groups[1]!.children[0]!.patch.paths, ["a"]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

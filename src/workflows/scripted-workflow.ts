@@ -1136,6 +1136,8 @@ export interface WorkflowScriptChildResult {
 	outputReference?: string;
 	/** A file produced by the child runtime (output or worktree handoff), not its job directory. */
 	outputArtifactPath?: string;
+	/** Explicit host-produced worktree evidence, used once when the workflow settles. */
+	worktreeHandoff?: import("../shared/types.ts").ParallelHandoffReference;
 	recovery?: AcceptanceRecoveryMetadata;
 	outputPathMapping?: { requestedPath: string; savedPath: string };
 	externalAdapter?: import("../shared/types.ts").ExternalCliReceiptMetadata;

@@ -78,6 +78,8 @@ export interface WorktreeDiff {
 	insertions: number;
 	deletions: number;
 	patchPath: string;
+	/** Repository-relative paths, including both sides of a rename. Absent when capture failed. */
+	paths?: string[];
 	error?: string;
 }
 
@@ -1096,28 +1098,40 @@ function emptyDiff(index: number, agent: string, branch: string, patchPath: stri
 		insertions: 0,
 		deletions: 0,
 		patchPath,
+		...(!error ? { paths: [] } : {}),
 		...(error ? { error } : {}),
 	};
 }
 
-function parseNumstat(numstat: string): { filesChanged: number; insertions: number; deletions: number } {
-	const lines = numstat
-		.split("\n")
-		.map((line) => line.trim())
-		.filter(Boolean);
+function parseNumstat(numstat: string): { filesChanged: number; insertions: number; deletions: number; paths: string[] } {
+	// With -z Git emits paths verbatim. A rename has an empty path followed by
+	// separate old/new path records; tabs and newlines inside names stay intact.
+	const records = numstat.split("\0");
+	const paths = new Set<string>();
 	let filesChanged = 0;
 	let insertions = 0;
 	let deletions = 0;
 
-	for (const line of lines) {
-		const [rawInsertions, rawDeletions] = line.split("\t");
-		if (rawInsertions === undefined || rawDeletions === undefined) continue;
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index]!;
+		if (!record) continue;
+		const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(record);
+		if (!match) throw new Error("Invalid NUL-delimited worktree diff statistics.");
+		const [, rawInsertions, rawDeletions, file] = match;
+		if (file) paths.add(file);
+		else {
+			const oldPath = records[++index];
+			const newPath = records[++index];
+			if (!oldPath || !newPath) throw new Error("Incomplete worktree rename statistics.");
+			paths.add(oldPath);
+			paths.add(newPath);
+		}
 		filesChanged++;
-		if (/^\d+$/.test(rawInsertions)) insertions += parseInt(rawInsertions, 10);
-		if (/^\d+$/.test(rawDeletions)) deletions += parseInt(rawDeletions, 10);
+		if (rawInsertions !== "-") insertions += Number(rawInsertions);
+		if (rawDeletions !== "-") deletions += Number(rawDeletions);
 	}
 
-	return { filesChanged, insertions, deletions };
+	return { filesChanged, insertions, deletions, paths: [...paths].sort() };
 }
 
 function captureWorktreeDiff(
@@ -1130,7 +1144,7 @@ function captureWorktreeDiff(
 	runGitChecked(worktree.path, ["add", "-A"]);
 	const diffStat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--stat", setup.baseCommit]).trim();
 	const patch = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_PATCH_OPTIONS, setup.baseCommit]);
-	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", setup.baseCommit]);
+	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", "-z", setup.baseCommit]);
 	fs.writeFileSync(patchPath, patch, "utf-8");
 
 	if (!patch.trim()) {
@@ -1149,6 +1163,7 @@ function captureWorktreeDiff(
 		filesChanged: parsed.filesChanged,
 		insertions: parsed.insertions,
 		deletions: parsed.deletions,
+		paths: parsed.paths,
 		patchPath,
 	};
 }

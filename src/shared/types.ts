@@ -427,6 +427,8 @@ export interface ParallelHandoffPatch {
 	filesChanged: number;
 	insertions: number;
 	deletions: number;
+	/** Captured repository-relative paths; rename sources and destinations are both included. */
+	paths?: string[];
 	error?: string;
 }
 
@@ -1534,6 +1536,8 @@ export interface Details {
 	mission?: MissionRecord;
 	workflow?: {
 		value?: unknown;
+		/** Completion-time inventory of isolated child changes and shared file paths. */
+		worktreeOverlaps?: import("../workflows/worktree-overlaps.ts").WorktreeOverlapReport;
 		failureKind?: WorkflowScriptFailureKind;
 		args?: Record<string, unknown>;
 		argsDigest?: string;
