@@ -78,22 +78,27 @@ function reviewGroupsFor(rows: WorktreeOverlapChild[], overlaps: WorktreeOverlap
 	return { reviewGroups: [...groups.values()], disjointChildren: rows.filter((row) => row.paths !== undefined && !parents.has(row.key)).map((row) => row.key) };
 }
 
-/** Completion-only projection of captured handoffs. It never scans worktrees or invokes Git. */
+/** Automatic completion summary stays quiet for fewer than two isolated children. */
 export function analyzeWorktreeOverlaps(children: readonly WorkflowScriptChildResult[]): WorktreeOverlapReport | undefined {
 	const isolated = children.filter((child) => child.worktreeHandoff || child.worktreeRequested);
 	if (isolated.length < 2) return undefined;
+	return inspectWorktreeChanges(isolated);
+}
+
+/** Read-only snapshot of selected child evidence; never scans worktrees or invokes Git. */
+export function inspectWorktreeChanges(children: readonly WorkflowScriptChildResult[]): WorktreeOverlapReport {
 	const rows: WorktreeOverlapChild[] = [];
 	let remainingBytes = MAX_REPORT_PATH_BYTES;
 	let remainingPaths = MAX_REPORT_PATHS;
-	for (const child of isolated) {
+	for (const child of children) {
 		const handoffPath = child.worktreeHandoff?.path;
 		const identity = { key: child.key, ...(child.runId ? { runId: child.runId } : {}), ...(child.agent ? { agent: child.agent } : {}), ...(handoffPath ? { handoffPath } : {}) };
-		if (!handoffPath) {
-			rows.push({ ...identity, error: "Isolated child returned no worktree handoff." });
-			continue;
-		}
 		if (child.state === "running" || child.detached || child.interrupted) {
 			rows.push({ ...identity, error: "Child has not finished; changed paths are unavailable." });
+			continue;
+		}
+		if (!handoffPath) {
+			rows.push({ ...identity, error: child.worktreeRequested ? "Isolated child returned no worktree handoff." : "Child has no managed-worktree handoff." });
 			continue;
 		}
 		try {

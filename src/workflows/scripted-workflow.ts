@@ -7,6 +7,7 @@ import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import { describeGateAcceptanceConflict, parseGateInput } from "../runs/shared/acceptance.ts";
 import type { AcceptanceRecoveryMetadata, HostStepNode, SingleResult, WorkflowScriptFailureKind } from "../shared/types.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
+import { inspectWorktreeChanges } from "./worktree-overlaps.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const BASE_REF_VALIDATION_ERROR = "baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.";
@@ -831,6 +832,7 @@ const runs = Object.freeze({
     return hostCall("steer", { key, message: message.trim(), options }, { key, operation: "steer" });
   },
   status(keyOrRunId) { return hostCall("status", { keyOrRunId }); },
+  worktreeChanges(keys) { return hostCall("worktreeChanges", { keys }); },
   ref: formatRef,
   refs(results) {
     if (!Array.isArray(results)) throw new Error("runs.refs(results) requires an array.");
@@ -2461,6 +2463,32 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return respond(Promise.reject(error));
 				}
 				return respond(Promise.resolve().then(() => options.state!.set(key, value)));
+			}
+
+			if (message.method === "worktreeChanges") {
+				const keys = message.args.keys;
+				if (!Array.isArray(keys) || keys.length > 64) return respond(Promise.reject(new Error("runs.worktreeChanges(keys) requires an array of at most 64 child keys.")));
+				const selected: WorkflowScriptChildResult[] = [];
+				try {
+					const unique = new Set<string>();
+					for (const value of keys) {
+						const key = validateKey(value, "runs.worktreeChanges");
+						if (unique.has(key)) throw new Error(`runs.worktreeChanges contains duplicate key '${key}'.`);
+						unique.add(key);
+					}
+					// Validate the complete selection before touching any artifact. Caller
+					// results and paths are never trusted as a source of child identity.
+					for (const key of unique) {
+						if (!launches.has(key)) throw new Error(`runs.worktreeChanges requires a prior runs.run/runs.all launch for '${key}'.`);
+						selected.push(children.get(key) ?? { key, ok: false, state: "running", output: "", artifactPaths: [] });
+					}
+				} catch (error) {
+					return respond(Promise.reject(error));
+				}
+				return respond(Promise.resolve().then(() => {
+					childController.signal.throwIfAborted();
+					return inspectWorktreeChanges(selected);
+				}), "runs.worktreeChanges result");
 			}
 
 			if (message.method === "status") {
