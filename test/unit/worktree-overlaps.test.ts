@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { analyzeWorktreeOverlaps, formatWorktreeOverlaps } from "../../src/workflows/worktree-overlaps.ts";
-import type { WorkflowScriptChildResult } from "../../src/workflows/scripted-workflow.ts";
+import { runWorkflowScript, type WorkflowScriptChildResult } from "../../src/workflows/scripted-workflow.ts";
 import type { ParallelHandoffManifest } from "../../src/shared/types.ts";
 import { readParallelHandoffManifest } from "../../src/runs/shared/parallel-handoff.ts";
 
@@ -37,6 +37,22 @@ function fixture(t: { after: (fn: () => void) => void }) {
 }
 
 describe("workflow worktree overlap analysis", () => {
+	it("retains requested isolation across admission failure without inferring it for resumes", async () => {
+		const result = await runWorkflowScript({
+			script: `return await runs.all([
+				{ key: "defaulted", agent: "worker", task: "Write" },
+				{ key: "isolated", agent: "worker", task: "Write", worktree: true },
+				{ key: "shared", agent: "worker", task: "Inspect", worktree: false },
+				{ key: "resume", resume: "retained", task: "Continue" }
+			]);`, defaultWorktree: true,
+			async admit() { throw new Error("admission rejected"); },
+			async launch() { assert.fail("admission must precede launch"); },
+			async status() { assert.fail("no status lookup"); },
+		});
+		assert.deepEqual(result.children.map(child => [child.key, child.worktreeRequested]), [
+			["defaulted", true], ["isolated", true], ["shared", undefined], ["resume", undefined],
+		]);
+	});
 	it("rejects an emptied changed patch but accepts an empty no-change patch", (t) => {
 		const { child } = fixture(t);
 		const changed = child("changed", ["lost.ts"]);
