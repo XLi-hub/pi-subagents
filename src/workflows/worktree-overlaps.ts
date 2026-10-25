@@ -28,7 +28,9 @@ export interface WorktreeOverlapReport {
 }
 
 const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
+const MAX_ANALYSIS_MANIFEST_BYTES = 8 * 1024 * 1024;
 const MAX_REPORT_PATH_BYTES = 2 * 1024 * 1024;
+const MAX_REPORT_REFERENCE_BYTES = 4 * 1024 * 1024;
 const MAX_REPORT_PATHS = 20_000;
 
 class UnavailableHandoff extends Error {}
@@ -44,8 +46,12 @@ function validPaths(value: unknown): value is string[] {
 		&& !/^[A-Za-z]:[/\\]/.test(file) && !file.split("/").some((part) => part === "." || part === ".."));
 }
 
-function patchAvailable(patchPath: unknown): boolean {
-	try { return typeof patchPath === "string" && fs.statSync(patchPath, { throwIfNoEntry: false })?.isFile() === true; }
+function patchAvailable(patchPath: unknown, changed: boolean): boolean {
+	try {
+		if (typeof patchPath !== "string" || !path.isAbsolute(patchPath)) return false;
+		const stat = fs.statSync(patchPath, { throwIfNoEntry: false });
+		return stat?.isFile() === true && (!changed || stat.size > 0);
+	}
 	catch { return false; }
 }
 
@@ -85,6 +91,8 @@ export function analyzeWorktreeOverlaps(children: readonly WorkflowScriptChildRe
 	const rows: WorktreeOverlapChild[] = [];
 	let remainingBytes = MAX_REPORT_PATH_BYTES;
 	let remainingPaths = MAX_REPORT_PATHS;
+	let remainingManifestBytes = MAX_ANALYSIS_MANIFEST_BYTES;
+	let remainingReferenceBytes = MAX_REPORT_REFERENCE_BYTES;
 	for (const child of isolated) {
 		const handoffPath = child.worktreeHandoff?.path;
 		const identity = { key: child.key, ...(child.runId ? { runId: child.runId } : {}), ...(child.agent ? { agent: child.agent } : {}), ...(handoffPath ? { handoffPath } : {}) };
@@ -101,40 +109,50 @@ export function analyzeWorktreeOverlaps(children: readonly WorkflowScriptChildRe
 			if (!stat) throw new UnavailableHandoff("Handoff is missing.");
 			if (!stat.isFile()) throw new UnavailableHandoff("Handoff is not a regular file.");
 			if (stat.size > MAX_MANIFEST_BYTES) throw new UnavailableHandoff("Handoff exceeds the analysis size limit.");
-			const manifest = readParallelHandoffManifest(handoffPath, MAX_MANIFEST_BYTES);
+			if (stat.size > remainingManifestBytes) throw new UnavailableHandoff("Handoff exceeds the aggregate analysis read limit.");
+			// Charge the full allowed read, including concurrent growth, before reading.
+			// Most manifests are small, so allow only their observed size, not 2 MiB each.
+			const readLimit = Math.min(MAX_MANIFEST_BYTES, remainingManifestBytes, Math.max(1, stat.size));
+			remainingManifestBytes -= readLimit;
+			const manifest = readParallelHandoffManifest(handoffPath, readLimit);
 			if (!manifest) throw new UnavailableHandoff("Handoff is missing.");
 			if (child.runId && manifest.runId !== child.runId) throw new UnavailableHandoff("Handoff belongs to a different child run.");
-			const patches = manifest.groups.flatMap((group) => group.children.map((entry) => ({ group, entry })));
-			if (patches.length === 0) throw new UnavailableHandoff("Handoff has no captured child patches.");
-			for (const { group, entry } of patches) {
-				const row: WorktreeOverlapChild = {
-					...identity,
-					key: patches.length === 1 ? child.key : `${child.key}:${entry.index}`,
-					agent: entry.agent,
-					patchPath: entry.patch.path,
-					baseCommit: group.baseCommit,
-				};
-				if (typeof group.repoRoot !== "string" || !path.isAbsolute(group.repoRoot)) {
-					row.error = "Handoff repository identity is unavailable.";
+			// A workflow launch is one child. Composite handoffs cannot be mapped back
+			// to that key without inventing identities that runs.run cannot address.
+			if (manifest.groups.length !== 1 || manifest.groups[0]!.children.length !== 1) throw new UnavailableHandoff("Handoff does not identify exactly one captured child patch.");
+			const group = manifest.groups[0]!;
+			const entry = group.children[0]!;
+			const row: WorktreeOverlapChild = {
+				...identity,
+				patchPath: entry.patch.path,
+				baseCommit: group.baseCommit,
+			};
+			if (typeof group.repoRoot !== "string" || !path.isAbsolute(group.repoRoot) || Buffer.byteLength(group.repoRoot, "utf8") > 32 * 1024) {
+				row.error = "Handoff repository identity is unavailable.";
+			} else if (typeof group.baseCommit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(group.baseCommit)) {
+				row.error = "Handoff base commit is unavailable.";
+			} else {
+				row.repoRoot = repoIdentity(group.repoRoot);
+				if (entry.patch.error) row.error = "Patch capture failed; changed paths are unavailable.";
+				else if (!patchAvailable(entry.patch.path, entry.patch.changed)) row.error = "Captured patch artifact is missing, empty, or unreadable.";
+				else if (!validPaths(entry.patch.paths) || entry.patch.changed !== (entry.patch.paths.length > 0)) {
+					row.error = "Handoff has no complete changed-path inventory.";
 				} else {
-					row.repoRoot = repoIdentity(group.repoRoot);
-					if (entry.patch.error) row.error = "Patch capture failed; changed paths are unavailable.";
-					else if (!patchAvailable(entry.patch.path)) row.error = "Captured patch artifact is missing or unreadable.";
-					else if (!validPaths(entry.patch.paths) || (entry.patch.changed && entry.patch.paths.length === 0)) {
-						row.error = "Handoff has no complete changed-path inventory.";
-					} else {
-						const paths = [...new Set(entry.patch.paths)].sort();
-						const bytes = paths.reduce((sum, file) => sum + Buffer.byteLength(file, "utf8"), 0);
-						if (paths.length > remainingPaths || bytes > remainingBytes) row.error = "Changed-path inventory exceeds the analysis size limit.";
-						else {
-							remainingPaths -= paths.length;
-							remainingBytes -= bytes;
-							row.paths = paths;
-						}
+					const paths = [...new Set(entry.patch.paths)].sort();
+					const bytes = paths.reduce((sum, file) => sum + Buffer.byteLength(file, "utf8"), 0);
+					// Shared paths repeat repository/key references in overlaps and groups.
+					// Bound that expansion too, including JSON escaping, not just filenames.
+					const referenceBytes = paths.reduce((sum, file) => sum + 3 * Buffer.byteLength(JSON.stringify([row.repoRoot, row.key, file]), "utf8") + 256, 0);
+					if (paths.length > remainingPaths || bytes > remainingBytes || referenceBytes > remainingReferenceBytes) row.error = "Changed-path inventory exceeds the analysis size limit.";
+					else {
+						remainingPaths -= paths.length;
+						remainingBytes -= bytes;
+						remainingReferenceBytes -= referenceBytes;
+						row.paths = paths;
 					}
 				}
-				rows.push(row);
 			}
+			rows.push(row);
 		} catch (error) {
 			rows.push({ ...identity, error: error instanceof UnavailableHandoff ? error.message : "Handoff is invalid or cannot be read." });
 		}
