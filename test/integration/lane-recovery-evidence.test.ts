@@ -11,6 +11,43 @@ type Value = { board: Array<{ state: string; stages: Stage[] }>; child: Stage };
 
 describe("public lane recovery evidence", { skip: !available }, () => {
 	installAsyncExecutionHooks();
+	for (const removeSession of [false, true]) it(`rechecks a settled resumability snapshot before follow-up (session removed=${removeSession})`, async () => {
+		mockPi.onCall({ matchArgIncludes: "Initial snapshot task", output: "Original report" });
+		if (!removeSession) mockPi.onCall({ matchArgIncludes: "Inspect checkpoint", output: "Follow-up report" });
+		const executor = createSubagentExecutor({
+			pi: { events: createEventBus(), getSessionName: () => undefined, sendMessage() {} },
+			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {}, asyncByDefault: false, tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir, expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+		});
+		const original = await executor.executePublic("original-board", {
+			workflowScript: `return await runs.lanes([{ key: "api", stages: [{ key: "write", agent: "worker", task: "Initial snapshot task", acceptance: false }] }]);`, async: false,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.notEqual(original.isError, true, original.content[0]?.text);
+		const stage = (original.details.workflow!.value as Value["board"])[0]!.stages[0]!;
+		assert.equal(stage.resumability?.state, "resumable");
+		const child = original.details.results[0]!;
+		assert.ok(child.sessionFile && fs.existsSync(child.sessionFile));
+		const originalOutputPath = child.savedOutputPath ?? child.artifactPaths?.outputPath;
+		assert.ok(originalOutputPath);
+		const originalBytes = fs.readFileSync(originalOutputPath);
+		if (removeSession) fs.unlinkSync(child.sessionFile);
+		const followup = await executor.executePublic("followup-from-board", {
+			workflowScript: `return await runs.all([{ key: "api-followup", resume: args.runId, task: "Inspect checkpoint" }]);`, args: { runId: stage.runId }, async: false,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.notEqual(followup.isError, true, followup.content[0]?.text);
+		const [resumed] = followup.details.workflow!.value as Array<{ ok: boolean; error?: string; runId?: string; output: string }>;
+		assert.equal(resumed!.ok, !removeSession);
+		if (removeSession) assert.match(resumed!.error ?? "", /session|resume|recovery/i);
+		else {
+			assert.notEqual(resumed!.runId, stage.runId);
+			assert.match(resumed!.output, /Follow-up report/);
+		}
+		assert.deepEqual(fs.readFileSync(originalOutputPath), originalBytes, "follow-up must retain the original report");
+		// Retained resumes use a background runner, so count both transports.
+		assert.equal(mockPi.callCount(), removeSession ? 1 : 2);
+	});
 	for (const async of [false, true]) for (const scenario of ["timeout", "unlaunched", "acceptance"] as const) {
 		it(`preserves ${scenario} facts through the lane board (async=${async})`, async () => {
 			const reportPath = path.join(tempDir, "implementation-report.md");

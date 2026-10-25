@@ -238,6 +238,8 @@ These facts let a script distinguish a blocked lane with a retained session from
 
 Recovery reasons remain bounded to 256 UTF-8 bytes. Run IDs and report paths over that limit are omitted rather than truncated into a different reference, and a row without an exact run ID never advertises resumability. Running receipts and skipped stages do not expose settled recovery facts. Stopped or supervisor-detached stages do not advertise a resumable session; answer an outstanding supervisor request through its existing route first.
 
+When several stages returned resumable sessions, select the latest relevant stage for the follow-up rather than resuming every row. A retained resume can produce a new run ID; keep that returned ID for subsequent passes. Recovery never overwrites the earlier report by default. A session that disappears after the board was captured is rejected before a new child launches.
+
 ### Typed post-run checks and typed steps
 
 Two ways to put a small classifier (a script, a lookup, a fast evaluation model) into a workflow without spending an LLM turn on it.
