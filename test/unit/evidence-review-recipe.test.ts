@@ -19,7 +19,7 @@ async function execute(options: {
 	const snapshots: unknown[][] = [];
 	try {
 		const execution = await runWorkflowScript({
-			script, args: options.args ?? args, timeoutMs: 5000, concurrency: 4,
+			script, args: options.args ?? args, timeoutMs: 5000, globalConcurrencyLimit: 4,
 			onEmit: values => snapshots.push(values),
 			async launch(key, params) {
 				launches.push({ key, params });

@@ -14,20 +14,20 @@ type Report = { stage?: string; state: string; verdict: string; reviews: unknown
 describe("public evidence review recipe", { skip: !available }, () => {
 	installAsyncExecutionHooks();
 	for (const async of [false, true]) for (const scenario of ["minority", "cap", "missing-verifier", "invalid-review"] as const) {
-		it(`retains review evidence for ${scenario} (async=${async})`, async () => {
+		it(`retains review evidence for ${scenario} (async=${async})`, async (t) => {
 			fs.mkdirSync(path.join(tempDir, "workflows"), { recursive: true });
 			fs.writeFileSync(path.join(tempDir, "workflows/evidence-review.js"), script);
 			const one = scenario === "cap" ? inventory([finding("P2")]) : inventory();
 			const two = scenario === "invalid-review" ? inventory([finding("P9")]) : inventory([finding()]);
-			mockPi.onCall({ matchArgIncludes: "Review angle: First", structuredOutput: one });
-			mockPi.onCall({ matchArgIncludes: "Review angle: Second", ...(scenario === "invalid-review" ? {
+			mockPi.onCall({ matchArgIncludes: "Review angle: First", delay: 30, structuredOutput: one });
+			mockPi.onCall({ matchArgIncludes: "Review angle: Second", delay: 30, ...(scenario === "invalid-review" ? {
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: two } },
 					{ type: "tool_execution_end", toolName: "structured_output", isError: true },
 					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed: severity P9" }], isError: true } },
 				],
 			} : { structuredOutput: two }) });
-			mockPi.onCall({ matchArgIncludes: "Review angle: Third", structuredOutput: inventory() });
+			mockPi.onCall({ matchArgIncludes: "Review angle: Third", delay: 30, structuredOutput: inventory() });
 			if (scenario !== "invalid-review") mockPi.onCall({
 				matchArgIncludes: '"id":"review-2.1"',
 				...(scenario === "missing-verifier" ? { output: "Could not finish the check" } :
@@ -40,10 +40,14 @@ describe("public evidence review recipe", { skip: !available }, () => {
 				getSubagentSessionRoot: () => tempDir, expandTilde: (value: string) => value,
 				discoverAgents: () => ({ agents: [makeAgent("reviewer", { tools: ["read", "grep", "find", "ls"] })] }),
 			});
+			let maxActive = 0;
+			const sampleActive = () => { maxActive = Math.max(maxActive, mockPi.sessions.filter(session => !session.settled && !session.disposed).length); };
+			const sampler = setInterval(sampleActive, 1);
+			t.after(() => clearInterval(sampler));
 			const result = await executor.executePublic(`evidence-${scenario}-${async}`, {
 				workflow: "./workflows/evidence-review.js",
 				args: { target: "src/run.ts and supplied diff", angles: ["First", "Second", "Third"], maxVerifications: 1 },
-				async, options: { concurrency: 3 },
+				async, options: { globalConcurrencyLimit: 2 },
 			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			let workflow: { value?: Report; emits: Report[] };
 			let success: boolean;
@@ -57,6 +61,8 @@ describe("public evidence review recipe", { skip: !available }, () => {
 				success = !result.isError;
 			}
 			assert.equal(success, scenario === "minority", JSON.stringify(workflow));
+			clearInterval(sampler);
+			assert.equal(maxActive, 2, "workflow concurrency must cap active children across both passes");
 			assert.equal(workflow.emits.length, 2);
 			const report = workflow.value ?? workflow.emits.at(-1)!;
 			assert.equal(report.state, success ? "complete" : "incomplete");

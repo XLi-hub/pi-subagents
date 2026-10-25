@@ -13,7 +13,7 @@ subagent({
     maxVerifications: 3
   },
   async: true,
-  options: { concurrency: 3 }
+  options: { globalConcurrencyLimit: 3 }
 });
 ```
 
