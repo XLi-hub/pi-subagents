@@ -79,7 +79,7 @@ export interface WorktreeDiff {
 	insertions: number;
 	deletions: number;
 	patchPath: string;
-	/** Repository-relative paths, including both sides of a rename. Absent when capture failed. */
+	/** Repository-relative paths, including both sides of a rename. Unavailable on capture failure or non-UTF-8 filenames. */
 	paths?: string[];
 	error?: string;
 }
