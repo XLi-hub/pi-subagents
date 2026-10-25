@@ -49,6 +49,8 @@ The package includes reusable prompt templates for common workflows. You do not 
 
 Add `autofix` to `/parallel-review` or `/parallel-cleanup` to apply only the synthesized fixes worth doing now after reviewers return.
 
+For a repeatable review that preserves each finding and explicitly verifies a bounded number of claims, use the [evidence review recipe](recipes/evidence-review.md). It composes existing scripted workflows and structured outputs; unresolved or deferred findings leave the review incomplete.
+
 ## Scripted workflows
 
 Use direct `{ agent, task }` for one bounded child. Use a workflow script when the parent needs a stable keyed child, sequence, fanout, steering, retry, or aggregation. For ordinary parallel fanout, use `await runs.all([{ key, agent, task }, ...])`. It resolves to an ordered array, not a key map, so use indexes, destructuring, or `.map(...)`, not `results.<key>`. Do not read `.output` from unawaited `runs.run` launches. Store a `runs.run` promise only when the script later observes it with `await`, `Promise.race`, or `Promise.all`, such as steering a live child before awaiting its result. Scripts are ordinary JavaScript statement bodies. Use an explicit `return` for a useful result.
