@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
 	cleanupWorktrees,
+	validateWorktreePatch,
 	createWorktrees,
 	diffWorktrees,
 	findWorktreeTaskCwdConflict,
@@ -917,6 +918,39 @@ process.stdout.write("corrupt external diff output\\n");
 			assert.equal(git(worktree.path, ["apply", "--check", "--cached", "--reverse", diffs[0]!.patchPath]), "");
 		} finally {
 			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("preserves patches when Git filenames cannot be represented as UTF-8", { skip: process.platform === "win32" ? "Windows filenames use Unicode" : undefined }, async (t) => {
+		const repoDir = createRepo("pi-worktree-raw-paths-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			git(repoDir, ["config", "core.quotePath", "true"]);
+			setup = await createWorktrees(repoDir, "raw-paths", 3, { provider: "native" });
+			const names = [Buffer.from([0x61, 0xff, 0x2e, 0x74, 0x73]), Buffer.from([0x61, 0xfe, 0x2e, 0x74, 0x73]), Buffer.from("a\uFFFD.ts")];
+			for (const [index, name] of names.entries()) {
+				const worktree = setup.worktrees[index]!;
+				try { fs.writeFileSync(Buffer.concat([Buffer.from(worktree.path + path.sep), name]), "export const value = true;\n"); }
+				catch (error) {
+					if (["EINVAL", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) { t.skip("Filesystem cannot preserve raw filename bytes"); return; }
+					throw error;
+				}
+				if (!fs.readdirSync(worktree.path, { encoding: "buffer" }).some(entry => entry.equals(name))) { t.skip("Filesystem normalizes raw filename bytes"); return; }
+			}
+			const diffs = diffWorktrees(setup, ["worker", "worker", "worker"], path.join(repoDir, "diffs"));
+			assert.equal(diffs.length, 3);
+			for (const [index, diff] of diffs.entries()) {
+				assert.equal(diff.error, undefined);
+				assert.equal(diff.filesChanged, 1);
+				assert.ok(fs.statSync(diff.patchPath).size > 0);
+				assert.equal(validateWorktreePatch(setup.worktrees[index]!.path, diff.patchPath), undefined);
+			}
+			assert.equal(diffs[0]?.paths, undefined);
+			assert.equal(diffs[1]?.paths, undefined);
+			assert.deepEqual(diffs[2]?.paths, ["a\uFFFD.ts"], "a literal replacement character is valid Unicode");
+		} finally {
+			if (setup) cleanupWorktrees(setup);
 			cleanupRepo(repoDir);
 		}
 	});

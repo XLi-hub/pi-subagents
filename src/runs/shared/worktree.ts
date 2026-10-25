@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { runSetupCommand, type SetupCommandOptions, type SetupCommandResult } from "./worktree-setup-command.ts";
 import * as fs from "node:fs";
@@ -279,23 +280,30 @@ class SetupTransaction {
 	}
 }
 
-function runGit(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
-	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", windowsHide: true, shell: false, ...(env ? { env: { ...process.env, ...env } } : {}) });
+function runGitBytes(cwd: string, args: string[], env?: NodeJS.ProcessEnv) {
+	const result = spawnSync("git", ["-C", cwd, ...args], { windowsHide: true, shell: false, ...(env ? { env: { ...process.env, ...env } } : {}) });
 	return {
-		stdout: result.stdout ?? "",
-		stderr: result.stderr ?? "",
+		stdout: result.stdout ?? Buffer.alloc(0),
+		stderr: result.stderr ?? Buffer.alloc(0),
 		status: result.status,
 	};
 }
 
-function runGitChecked(cwd: string, args: string[]): string {
-	const result = runGit(cwd, args);
+function runGit(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
+	const result = runGitBytes(cwd, args, env);
+	return { stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8"), status: result.status };
+}
+
+function runGitChecked(cwd: string, args: string[]): string;
+function runGitChecked(cwd: string, args: string[], raw: true): Buffer;
+function runGitChecked(cwd: string, args: string[], raw = false): string | Buffer {
+	const result = runGitBytes(cwd, args);
 	if (result.status !== 0) {
 		const command = `git -C ${cwd} ${args.join(" ")}`;
-		const message = result.stderr.trim() || result.stdout.trim() || `${command} failed`;
+		const message = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim() || `${command} failed`;
 		throw new Error(message);
 	}
-	return result.stdout;
+	return raw ? result.stdout : result.stdout.toString("utf8");
 }
 
 /** Validate a captured patch against the worktree index without changing either. */
@@ -1103,10 +1111,13 @@ function emptyDiff(index: number, agent: string, branch: string, patchPath: stri
 	};
 }
 
-function parseNumstat(numstat: string): { filesChanged: number; insertions: number; deletions: number; paths: string[] } {
+function parseNumstat(numstat: Buffer): { filesChanged: number; insertions: number; deletions: number; paths?: string[] } {
 	// With -z Git emits paths verbatim. A rename has an empty path followed by
 	// separate old/new path records; tabs and newlines inside names stay intact.
-	const records = numstat.split("\0");
+	// Git permits byte filenames that JSON strings cannot represent losslessly.
+	// Keep usable patches/statistics, but never publish replacement characters as identities.
+	const losslessPaths = isUtf8(numstat);
+	const records = numstat.toString("utf8").split("\0");
 	const paths = new Set<string>();
 	let filesChanged = 0;
 	let insertions = 0;
@@ -1131,7 +1142,7 @@ function parseNumstat(numstat: string): { filesChanged: number; insertions: numb
 		if (rawDeletions !== "-") deletions += Number(rawDeletions);
 	}
 
-	return { filesChanged, insertions, deletions, paths: [...paths].sort() };
+	return { filesChanged, insertions, deletions, ...(losslessPaths ? { paths: [...paths].sort() } : {}) };
 }
 
 function captureWorktreeDiff(
@@ -1144,7 +1155,7 @@ function captureWorktreeDiff(
 	runGitChecked(worktree.path, ["add", "-A"]);
 	const diffStat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--stat", setup.baseCommit]).trim();
 	const patch = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_PATCH_OPTIONS, setup.baseCommit]);
-	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", "-z", setup.baseCommit]);
+	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", "-z", setup.baseCommit], true);
 	fs.writeFileSync(patchPath, patch, "utf-8");
 
 	if (!patch.trim()) {
@@ -1163,7 +1174,7 @@ function captureWorktreeDiff(
 		filesChanged: parsed.filesChanged,
 		insertions: parsed.insertions,
 		deletions: parsed.deletions,
-		paths: parsed.paths,
+		...(parsed.paths ? { paths: parsed.paths } : {}),
 		patchPath,
 	};
 }
