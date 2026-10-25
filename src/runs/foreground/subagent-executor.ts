@@ -6205,6 +6205,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							workflowRunId,
 							processCwd: ctx.cwd,
 							globalConcurrencyLimit: requestParams.globalConcurrencyLimit ?? deps.config.globalConcurrencyLimit,
+							defaultWorktree: workflowChildDefaults.worktree === true || (workflowChildDefaults.worktree === undefined && deps.config.worktree === true),
 							timeoutMs: timeout,
 							signal: controller.signal,
 							continueAfterAbortWhenChildrenSettled: (abortError) => {
@@ -6570,6 +6571,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					processCwd: ctx.cwd,
 					...(delegatedWorkflowPermit ? { oneUsePermit: { claim: (key: string) => claimWorkflowChildPermit(delegatedWorkflowPermit, foregroundWorkflowRunId, key) } } : {}),
 					globalConcurrencyLimit: requestParams.globalConcurrencyLimit ?? deps.config.globalConcurrencyLimit,
+					defaultWorktree: workflowChildDefaults.worktree === true || (workflowChildDefaults.worktree === undefined && deps.config.worktree === true),
 					timeoutMs: timeout,
 					signal,
 					...(workflowState ? { state: workflowState } : {}),

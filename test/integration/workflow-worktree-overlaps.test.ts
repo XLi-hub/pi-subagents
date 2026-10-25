@@ -6,11 +6,11 @@ import type { WorktreeOverlapReport } from "../../src/workflows/worktree-overlap
 import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
 import { installAsyncExecutionHooks, available, createSubagentExecutor, mockPi, tempDir, createRepo, readAsyncPayload, ASYNC_DIR } from "../support/async-execution-fixture.ts";
 
-function makeOverlapExecutor() {
+function makeOverlapExecutor(config: Record<string, unknown> = {}) {
 	return createSubagentExecutor!({
 		pi: { events: createEventBus(), getSessionName: () => undefined, sendMessage() {} },
 		state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
-		config: { worktreeProvider: "native" }, asyncByDefault: false, tempArtifactsDir: tempDir,
+		config: { worktreeProvider: "native", ...config }, asyncByDefault: false, tempArtifactsDir: tempDir,
 		getSubagentSessionRoot: () => tempDir, expandTilde: (p: string) => p,
 		discoverAgents: () => ({ agents: [makeAgent("worker")] }),
 	});
@@ -18,6 +18,29 @@ function makeOverlapExecutor() {
 
 describe("workflow worktree overlap results", { skip: !available }, () => {
 	installAsyncExecutionHooks();
+	for (const background of [false, true]) for (const defaultWorktree of [false, true]) {
+		it(`retains isolation intent when batch admission fails (async=${background}, default=${defaultWorktree})`, async () => {
+			const repo = createRepo("pi-overlap-admission-");
+			fs.writeFileSync(path.join(repo, "dirty.txt"), "dirty");
+			try {
+				const result = await makeOverlapExecutor(defaultWorktree ? { worktree: true } : {}).executePublic("overlap-admission", {
+					workflowScript: `return await runs.all([
+						{ key: "api", agent: "worker", task: "Write API", cwd: args.repo ${defaultWorktree ? "" : ", worktree: true"} },
+						{ key: "ui", agent: "worker", task: "Write UI", cwd: args.repo ${defaultWorktree ? "" : ", worktree: true"} },
+						{ key: "shared", agent: "worker", task: "Inspect", worktree: false }
+					]);`,
+					args: { repo }, async: background, mission: false, output: false,
+				}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+				const payload = background ? await readAsyncPayload(result.details.asyncId!) : result.details;
+				const report = payload.workflow?.worktreeOverlaps as WorktreeOverlapReport | undefined;
+				assert.ok(report, JSON.stringify(payload.workflow));
+				assert.equal(report.state, "incomplete");
+				assert.deepEqual(report.children.map(row => row.key), ["api", "ui"]);
+				assert.ok(report.children.every(row => row.paths === undefined));
+				assert.equal(mockPi.sessions.length, 0);
+			} finally { fs.rmSync(repo, { recursive: true, force: true }); }
+		});
+	}
 	for (const background of [false, true]) {
 		for (const outcome of ["overlap", "disjoint", "failure"] as const) {
 			it(`reports captured child changes at completion (${outcome}, async=${background})`, async () => {
