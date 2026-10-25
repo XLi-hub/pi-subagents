@@ -49,8 +49,13 @@ function validPaths(value: unknown): value is string[] {
 function patchAvailable(patchPath: unknown, changed: boolean): boolean {
 	try {
 		if (typeof patchPath !== "string" || !path.isAbsolute(patchPath)) return false;
-		const stat = fs.statSync(patchPath, { throwIfNoEntry: false });
-		return stat?.isFile() === true && (!changed || stat.size > 0);
+		// Open with the current reader's permissions, pin the inode, and avoid
+		// blocking if the path was replaced with a FIFO. No patch contents are read.
+		const fd = fs.openSync(patchPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		try {
+			const stat = fs.fstatSync(fd);
+			return stat.isFile() && (!changed || stat.size > 0);
+		} finally { fs.closeSync(fd); }
 	}
 	catch { return false; }
 }

@@ -37,6 +37,21 @@ function fixture(t: { after: (fn: () => void) => void }) {
 }
 
 describe("workflow worktree overlap analysis", () => {
+	it("does not call currently unreadable patch evidence complete", (t) => {
+		const { dir, child } = fixture(t);
+		const unreadable = child("unreadable", ["shared.ts"]);
+		const readable = child("readable", ["shared.ts"]);
+		const file = path.join(dir, "unreadable.patch");
+		try {
+			fs.chmodSync(file, 0o000);
+			try { fs.readFileSync(file); t.skip("This process can read mode-000 files"); return; }
+			catch (error) { assert.equal((error as NodeJS.ErrnoException).code, "EACCES"); }
+			const report = analyzeWorktreeOverlaps([unreadable, readable])!;
+			assert.equal(report.state, "incomplete");
+			assert.equal(report.children[0]?.paths, undefined);
+			assert.deepEqual(report.overlaps, []);
+		} finally { fs.chmodSync(file, 0o600); }
+	});
 	it("retains requested isolation across admission failure without inferring it for resumes", async () => {
 		const result = await runWorkflowScript({
 			script: `return await runs.all([
