@@ -13,7 +13,7 @@ if (!Number.isInteger(maxVerifications) || maxVerifications < 0 || maxVerificati
   throw new Error("maxVerifications must be an integer from 0 to 12");
 }
 
-const text = { type: "string", minLength: 1, maxLength: 3000 };
+const text = { type: "string", minLength: 1, maxLength: 3000, pattern: "\\S" };
 const reviewSchema = {
   type: "object", additionalProperties: false,
   properties: {

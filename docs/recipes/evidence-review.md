@@ -21,6 +21,8 @@ Choose one to four distinct angles for the actual change. `target` must identify
 
 The workflow launches one fresh, read-only `reviewer` per angle with `outputSchema`. Each returns a coverage note and up to three findings. Reviewers must mark their inventory `blocked` if the limit or unavailable evidence prevents completion. Findings then receive fresh, narrowly scoped verification children, ordered P0, P1, P2 with stable first-pass order for ties. There is no deduplication, vote, or extra synthesis child. Repeated claims retain separate identities; the parent can compare them in the report.
 
+Coverage, claims, locations, and evidence must contain a non-whitespace character. The schema rejects blank placeholders in both passes; this checks the shape of evidence, while the parent still assesses its substance.
+
 `maxVerifications` defaults to three and accepts integers from zero to twelve. It caps follow-up child launches, not model turns, tokens, or elapsed time. A child can take multiple turns, including structured-output corrections. With three angles and the default cap, the workflow launches three initial reviewers and at most three verifiers. An empty inventory launches no verifiers. These launches happen only when this recipe is explicitly invoked; `/parallel-review` keeps its existing behavior. Existing workflow concurrency, spawn limits, deadline, and usage-budget controls still apply and may prevent completion.
 
 ## Read the evidence

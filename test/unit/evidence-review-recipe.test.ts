@@ -72,10 +72,10 @@ describe("evidence review recipe", () => {
 		const { launches } = await execute({ respond: key => key === "review-1" ? { structuredOutput: inventory([finding()]) } : {} });
 		const reviewSchema = launches[0]!.params.outputSchema as Record<string, unknown>;
 		const verificationSchema = launches.at(-1)!.params.outputSchema as Record<string, unknown>;
-		for (const value of [inventory([finding("P9")]), inventory([finding(), finding(), finding(), finding()]), inventory([{ ...finding(), evidence: "" }])]) {
+		for (const value of [inventory([finding("P9")]), inventory([finding(), finding(), finding(), finding()]), inventory([{ ...finding(), evidence: "" }]), inventory([{ ...finding(), evidence: " \n\t" }]), { ...inventory(), coverage: " " }]) {
 			assert.equal((await validateStructuredOutputValue(reviewSchema, value)).status, "invalid");
 		}
-		for (const value of [{ disposition: "invalid", evidence: "" }, { disposition: "clean", evidence: "claim" }, { disposition: "valid" }]) {
+		for (const value of [{ disposition: "invalid", evidence: "" }, { disposition: "valid", evidence: " \n\t" }, { disposition: "clean", evidence: "claim" }, { disposition: "valid" }]) {
 			assert.equal((await validateStructuredOutputValue(verificationSchema, value)).status, "invalid");
 		}
 		assert.equal((await validateStructuredOutputValue(reviewSchema, inventory([finding()]))).status, "valid");
