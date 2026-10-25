@@ -31,6 +31,26 @@ function fixture(t: { after: (fn: () => void) => void }) {
 const noStatus = async (): Promise<WorkflowScriptChildResult> => { throw new Error("Inspection must not widen into a status lookup."); };
 
 describe("runs.worktreeChanges", () => {
+	it("bounds cumulative selected-key inspections without charging rejected selections", async (t) => {
+		const { child } = fixture(t);
+		const run = () => runWorkflowScript({
+			script: `
+				await runs.run("api", { agent: "worker", task: "API" });
+				for (let index = 0; index < 255; index++) await runs.worktreeChanges(["api"]);
+				try { await runs.worktreeChanges(["api", "unknown"]); } catch {}
+				const last = await runs.worktreeChanges(["api"]);
+				let error = "";
+				try { await runs.worktreeChanges(["api"]); } catch (caught) { error = caught.message; }
+				const empty = await runs.worktreeChanges([]);
+				return { last: last.state, empty: empty.state, error };
+			`,
+			async launch() { return child("api", ["api.ts"]); }, status: noStatus,
+		});
+		for (let workflow = 0; workflow < 2; workflow++) {
+			const result = await run();
+			assert.deepEqual(result.value, { last: "complete", empty: "complete", error: "runs.worktreeChanges exceeds the workflow limit of 256 selected-key inspections." });
+		}
+	});
 	it("lets a workflow launch explicit reviewers for the captured file groups", async (t) => {
 		const { child } = fixture(t);
 		const launches: Array<{ key: string; task: unknown }> = [];

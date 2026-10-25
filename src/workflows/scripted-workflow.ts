@@ -2167,6 +2167,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const children = new Map<string, WorkflowScriptChildResult>();
 	const childOrder: string[] = [];
 	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
+	let worktreeInspectionKeys = 0;
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
 	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
 	const stoppedLaunches = new Set<string>();
@@ -2485,6 +2486,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				} catch (error) {
 					return respond(Promise.reject(error));
 				}
+				if (worktreeInspectionKeys + selected.length > 256) return respond(Promise.reject(new Error("runs.worktreeChanges exceeds the workflow limit of 256 selected-key inspections.")));
+				worktreeInspectionKeys += selected.length;
 				return respond(Promise.resolve().then(() => {
 					childController.signal.throwIfAborted();
 					return inspectWorktreeChanges(selected);
