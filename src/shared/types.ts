@@ -427,7 +427,7 @@ export interface ParallelHandoffPatch {
 	filesChanged: number;
 	insertions: number;
 	deletions: number;
-	/** Captured repository-relative paths; rename sources and destinations are both included. */
+	/** Captured repository-relative UTF-8 paths, including both sides of a rename; unavailable on failed or lossy capture. */
 	paths?: string[];
 	error?: string;
 }
