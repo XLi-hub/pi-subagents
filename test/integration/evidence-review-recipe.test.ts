@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
+import { flattenSubagentToolOptions } from "../../src/extension/subagent-options.ts";
 import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
 import { available, installAsyncExecutionHooks, mockPi, tempDir, readAsyncPayload } from "../support/async-execution-fixture.ts";
 
@@ -44,11 +45,11 @@ describe("public evidence review recipe", { skip: !available }, () => {
 			const sampleActive = () => { maxActive = Math.max(maxActive, mockPi.sessions.filter(session => !session.settled && !session.disposed).length); };
 			const sampler = setInterval(sampleActive, 1);
 			t.after(() => clearInterval(sampler));
-			const result = await executor.executePublic(`evidence-${scenario}-${async}`, {
+			const result = await executor.executePublic(`evidence-${scenario}-${async}`, flattenSubagentToolOptions({
 				workflow: "./workflows/evidence-review.js",
 				args: { target: "src/run.ts and supplied diff", angles: ["First", "Second", "Third"], maxVerifications: 1 },
 				async, options: { globalConcurrencyLimit: 2 },
-			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			}), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			let workflow: { value?: Report; emits: Report[] };
 			let success: boolean;
 			if (async) {
