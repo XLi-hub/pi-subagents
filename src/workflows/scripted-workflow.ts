@@ -353,7 +353,7 @@ function laneBoardText(value) {
   if (typeof value !== "string" || !value) return undefined;
   if (laneByteLength(value) <= MAX_LANE_BOARD_TEXT_BYTES) return value;
   const bytes = new TextEncoder().encode(value).subarray(0, MAX_LANE_BOARD_TEXT_BYTES - 3);
-  return new TextDecoder().decode(bytes) + "...";
+  return new TextDecoder().decode(bytes, { stream: true }) + "...";
 }
 
 function laneBoardPath(value) {
@@ -390,12 +390,35 @@ function laneStageIsBlocked(result) {
   return structured && typeof structured === "object" && !Array.isArray(structured) && structured.verdict === "blocked";
 }
 
+function laneStageRecovery(result, state, runId) {
+  const evidence = {};
+  if (!result || state === "running") return evidence;
+  const resumability = result.resumability;
+  if (resumability?.state === "resumable" && runId && !result.stopped && !result.detached) {
+    evidence.resumability = { state: "resumable" };
+  } else if (resumability?.state === "not-resumable" && typeof resumability.reason === "string" && resumability.reason.trim()) {
+    evidence.resumability = { state: "not-resumable", reason: laneBoardText(resumability.reason) };
+  }
+  const outcome = result.terminalOutcome;
+  if (outcome?.state === "partial" && (outcome.reason === "timeout" || outcome.reason === "budget_exhausted")) {
+    evidence.terminalOutcome = { state: "partial", reason: outcome.reason };
+  }
+  const recovery = result.recovery;
+  const reportPath = laneBoardPath(recovery?.reportPath);
+  if (recovery?.status === "available-for-review" && recovery.reason === "acceptance-metadata-rejected" &&
+      reportPath && typeof recovery.reportHash === "string" && /^[a-f0-9]{64}$/.test(recovery.reportHash)) {
+    evidence.recovery = { status: recovery.status, reason: recovery.reason, reportPath, reportHash: recovery.reportHash };
+  }
+  return evidence;
+}
+
 function laneStageRecord(stageKey, child, forcedState) {
   const result = child && typeof child === "object" && !Array.isArray(child) ? child : undefined;
   const ok = result?.ok === true;
   const verdict = laneStageVerdict(result);
   const blocked = laneStageIsBlocked(result);
   const state = forcedState ?? (result?.state === "running" ? "running" : result?.stopped ? "stopped" : result?.detached ? "detached" : ok ? blocked ? "blocked" : "completed" : "failed");
+  const runId = typeof result?.runId === "string" ? laneBoardPath(result.runId.trim()) : undefined;
   const error = state !== "completed" && state !== "running"
     ? state === "blocked" && blocked
       ? "Stage returned a blocked verdict."
@@ -407,12 +430,13 @@ function laneStageRecord(stageKey, child, forcedState) {
     : undefined;
   return {
     key: stageKey,
-    ...(typeof result?.runId === "string" && result.runId.trim() ? { runId: laneBoardText(result.runId.trim()) } : {}),
+    ...(runId ? { runId } : {}),
     ...(result ? { ok } : {}),
     state,
     ...(typeof result?.outputReference === "string" ? (laneBoardPath(result.outputReference) ? { outputReference: laneBoardPath(result.outputReference) } : {}) : {}),
     ...(verdict ? { verdict } : {}),
     ...(error ? { error: laneBoardText(error) } : {}),
+    ...laneStageRecovery(result, state, runId),
   };
 }
 
