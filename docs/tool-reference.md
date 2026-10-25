@@ -150,6 +150,8 @@ In workflow runs that omit `context`, each `runs.run` child follows the global `
 
 `await runs.worktreeChanges(keys)` reads the bounded captured-change report for up to 64 unique child keys already launched in the current workflow. It returns `{ version, state, children, overlaps, reviewGroups, disjointChildren }`; use each child's `patchPath`/`handoffPath` to give a reviewer concrete evidence. `state: "incomplete"` preserves missing or unfinished evidence. A single key is supported, and an empty selection returns an empty complete report.
 
+One workflow may inspect 256 selected keys cumulatively; rejected selections and empty queries do not consume that allowance. Each snapshot uses the completion analyzer's aggregate read and reference-expansion limits. Await writers through their run promises rather than polling this synchronous metadata query.
+
 Inputs are keys rather than caller-provided paths, result objects, or raw run ids. The complete selection is validated before reading any handoff, and the host uses its stored child results. The call is read-only and starts no work. It does not wait for pending children or count as awaiting their launch promises. Complete inventory is separate from child success: failed work can still have a captured patch, so check the child's `ok` as well. See the [grouped-review example](workflows.md#inspect-worktree-changes-inside-a-workflow).
 
 ### Workflow steering

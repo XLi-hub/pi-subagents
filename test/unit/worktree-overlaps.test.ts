@@ -37,6 +37,61 @@ function fixture(t: { after: (fn: () => void) => void }) {
 }
 
 describe("workflow worktree overlap analysis", () => {
+	it("rejects an emptied changed patch but accepts an empty no-change patch", (t) => {
+		const { child } = fixture(t);
+		const changed = child("changed", ["lost.ts"]);
+		const empty = child("empty", []);
+		fs.writeFileSync(path.join(path.dirname(changed.worktreeHandoff!.path), "changed.patch"), "");
+		fs.writeFileSync(path.join(path.dirname(empty.worktreeHandoff!.path), "empty.patch"), "");
+		const report = analyzeWorktreeOverlaps([changed, empty])!;
+		assert.equal(report.state, "incomplete");
+		assert.equal(report.children[0]?.paths, undefined);
+		assert.deepEqual(report.children[1]?.paths, []);
+	});
+
+	it("does not invent workflow keys for composite handoff patches", (t) => {
+		const { child, mutate } = fixture(t);
+		const composite = child("composite", ["shared.ts"]);
+		mutate(composite, manifest => {
+			const group = manifest.groups[0]!;
+			group.children.push({ ...group.children[0]!, index: 1, taskIndex: 1 });
+			group.cleanup.tasks.push({ ...group.cleanup.tasks[0]!, index: 1 });
+		});
+		const report = analyzeWorktreeOverlaps([composite, child("ok", ["shared.ts"])])!;
+		assert.equal(report.state, "incomplete");
+		assert.deepEqual(report.children.map(row => row.key), ["composite", "ok"]);
+		assert.deepEqual(report.overlaps, []);
+		assert.match(report.children[0]?.error ?? "", /exactly one/);
+	});
+
+	it("bounds reference expansion when many paths repeat a long repository identity", (t) => {
+		const { dir, child } = fixture(t);
+		const repo = path.join(dir, "r".repeat(4000));
+		const files = Array.from({ length: 1000 }, (_, i) => `file-${i}.ts`);
+		const report = analyzeWorktreeOverlaps([child("a", files, repo), child("b", files, repo)])!;
+		assert.equal(report.state, "incomplete");
+		assert.ok(Buffer.byteLength(JSON.stringify(report)) < 100_000);
+	});
+
+	it("bounds aggregate handoff reads even when each manifest fits its own limit", (t) => {
+		const { child, mutate } = fixture(t);
+		const values = Array.from({ length: 6 }, (_, i) => child("c" + i, ["shared.ts"]));
+		for (const value of values) mutate(value, manifest => { manifest.groups[0]!.children[0]!.summary = "x".repeat(1500 * 1024); });
+		const report = analyzeWorktreeOverlaps(values)!;
+		assert.equal(report.state, "incomplete");
+		assert.match(report.children.at(-1)?.error ?? "", /aggregate analysis read limit/);
+	});
+
+	it("requires consistent change metadata and a captured base identity", (t) => {
+		const { child, mutate } = fixture(t);
+		const inconsistent = child("inconsistent", ["one.ts"]);
+		mutate(inconsistent, manifest => { manifest.groups[0]!.children[0]!.patch.changed = false; });
+		const noBase = child("no-base", ["two.ts"]);
+		mutate(noBase, manifest => { manifest.groups[0]!.baseCommit = ""; });
+		const report = analyzeWorktreeOverlaps([inconsistent, noBase])!;
+		assert.equal(report.state, "incomplete");
+		assert.equal(report.children.filter(row => row.paths !== undefined).length, 0);
+	});
 	it("joins child patches by repository and exact path, keeping patch references and complete inventories", (t) => {
 		const { dir, child } = fixture(t);
 		const api = child("api", ["types.ts", "api.ts", "types.ts"]);
