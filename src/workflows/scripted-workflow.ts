@@ -1136,10 +1136,6 @@ export interface WorkflowScriptChildResult {
 	outputReference?: string;
 	/** A file produced by the child runtime (output or worktree handoff), not its job directory. */
 	outputArtifactPath?: string;
-	/** Explicit host-produced worktree evidence, used once when the workflow settles. */
-	worktreeHandoff?: import("../shared/types.ts").ParallelHandoffReference;
-	/** Known isolation intent, retained even if launch/setup returned no handoff. */
-	worktreeRequested?: true;
 	recovery?: AcceptanceRecoveryMetadata;
 	outputPathMapping?: { requestedPath: string; savedPath: string };
 	externalAdapter?: import("../shared/types.ts").ExternalCliReceiptMetadata;
@@ -1270,8 +1266,6 @@ export interface RunWorkflowScriptOptions {
 	continueAfterAbortWhenChildrenSettled?: (abortError: Error) => boolean;
 	/** Maximum children executing concurrently within this workflow. Defaults to 20. */
 	globalConcurrencyLimit?: number;
-	/** Effective host default, used only to retain isolation intent before admission. */
-	defaultWorktree?: boolean;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>, signal: AbortSignal) => void | Promise<void>;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
 	resolveResume?: (reference: WorkflowReceiptResumeReference | string, signal: AbortSignal, index?: number) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
@@ -2166,7 +2160,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const trace: WorkflowScriptTraceEntry[] = [];
 	const children = new Map<string, WorkflowScriptChildResult>();
 	const childOrder: string[] = [];
-	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string; worktreeRequested?: true }>();
+	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
 	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
 	const stoppedLaunches = new Set<string>();
@@ -2213,10 +2207,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			console.error("Workflow onHostStep callback failed:", error);
 		}
 	};
-	const stoppedChildResult = (key: string, message: string): WorkflowScriptChildResult => ({ key, ok: false, stopped: true, output: message, error: message, artifactPaths: [], ...(launches.get(key)?.worktreeRequested ? { worktreeRequested: true } : {}) });
+	const stoppedChildResult = (key: string, message: string): WorkflowScriptChildResult => ({ key, ok: false, stopped: true, output: message, error: message, artifactPaths: [] });
 	const responseBoundaryFailure = (key: string, error: unknown): WorkflowScriptChildResult => {
 		const text = error instanceof Error ? error.message : String(error);
-		return { key, ok: false, output: text, error: text, artifactPaths: [], ...(launches.get(key)?.worktreeRequested ? { worktreeRequested: true } : {}) };
+		return { key, ok: false, output: text, error: text, artifactPaths: [] };
 	};
 	const assertRecoveryBarrierAllowsRun = (key: string, params: Record<string, unknown>): void => {
 		if (!acceptanceRecoveryBarrier || isExplicitReadOnlyRecoveryReview(params)) return;
@@ -2633,7 +2627,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') resume requires a non-empty task follow-up.`)));
 			}
-			const worktreeRequested = params.worktree === true || (params.worktree === undefined && params.resume === undefined && options.defaultWorktree === true);
 			const startedAt = Date.now();
 			const batch = isRecord(message.args.batch) && typeof message.args.batch.id === "string" && Array.isArray(message.args.batch.calls)
 				? { id: message.args.batch.id, calls: message.args.batch.calls.filter((call): call is { key: string; params: Record<string, unknown> } => isRecord(call) && typeof call.key === "string" && isRecord(call.params)) }
@@ -2712,7 +2705,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				return stoppedChildResult(key, reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
 			}).then((result) => {
 				let normalized = !result.ok && result.state !== "running" && !result.error ? { ...result, error: result.output } : result;
-				if (worktreeRequested) normalized = { ...normalized, worktreeRequested: true };
 				if (resolvedResumeLineage?.length && normalized.runId) {
 					normalized = { ...normalized, continuation: { runIds: [...new Set([...resolvedResumeLineage, normalized.runId])] } };
 				}
@@ -2729,7 +2721,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				return normalized;
 			}, (error: unknown) => {
 				const text = error instanceof Error ? error.message : String(error);
-				const failure: WorkflowScriptChildResult = { key, ok: false, output: text, error: text, artifactPaths: [], ...(worktreeRequested ? { worktreeRequested: true } : {}) };
+				const failure: WorkflowScriptChildResult = { key, ok: false, output: text, error: text, artifactPaths: [] };
 				childStopControllers.delete(key);
 				if (stoppedLaunches.has(key)) return children.get(key) ?? { ...failure, stopped: true };
 				children.set(key, failure);
@@ -2738,7 +2730,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				notifyChildSettled(key, failure);
 				return failure;
 			});
-			launches.set(key, { fingerprint, promise, observed: callObserved, ...(generatedLaneKey ? { generatedLaneKey } : {}), ...(worktreeRequested ? { worktreeRequested: true } : {}) });
+			launches.set(key, { fingerprint, promise, observed: callObserved, ...(generatedLaneKey ? { generatedLaneKey } : {}) });
 			childOrder.push(key);
 			trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}) });
 			traceChanged();
