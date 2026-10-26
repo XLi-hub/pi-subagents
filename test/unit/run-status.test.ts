@@ -1953,31 +1953,6 @@ describe("async run status inspection", () => {
 		}
 	});
 
-	for (const invalid of [false, true]) it(`shows the saved worktree overlap result without reading child evidence (invalid=${invalid})`, () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-overlap-status-"));
-		try {
-			const asyncRoot = path.join(root, "runs");
-			const asyncDir = path.join(asyncRoot, "workflow");
-			fs.mkdirSync(asyncDir, { recursive: true });
-			fs.mkdirSync(path.join(root, "results"));
-			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
-				runId: "workflow", mode: "workflow", state: "complete", startedAt: 1, endedAt: 2, steps: [],
-				workflow: { trace: [], emits: [], console: [], worktreeOverlaps: invalid ? { version: 1, state: "complete", overlaps: null } : {
-					version: 1, state: "incomplete", overlaps: [{ repoRoot: root, path: "shared.ts", children: ["api", "ui"] }],
-					reviewGroups: [{ children: ["api", "ui"], sharedPaths: [{ repoRoot: root, path: "shared.ts" }] }],
-					children: [{ key: "api", handoffPath: path.join(root, "missing-handoff.json") }], disjointChildren: [],
-				} },
-			}));
-			const result = inspectSubagentStatus({ id: "workflow" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
-			assert.notEqual(result.isError, true);
-			const text = textContent(result);
-			assert.match(text, invalid ? /Worktree file overlaps: stored analysis is unavailable/ : /Worktree file overlaps: incomplete, 1 shared path\(s\), 1 review group\(s\)/);
-			assert.match(text, /Full report: .*status\.json \(workflow.worktreeOverlaps\)/);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
-
 	it("shows the head of a long completed result summary and the file that holds all of it", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-result-head-"));
 		try {

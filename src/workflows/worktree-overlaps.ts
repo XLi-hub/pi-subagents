@@ -89,13 +89,6 @@ function reviewGroupsFor(rows: WorktreeOverlapChild[], overlaps: WorktreeOverlap
 	return { reviewGroups: [...groups.values()], disjointChildren: rows.filter((row) => row.paths !== undefined && !parents.has(row.key)).map((row) => row.key) };
 }
 
-/** Automatic completion summary stays quiet for fewer than two isolated children. */
-export function analyzeWorktreeOverlaps(children: readonly WorkflowScriptChildResult[]): WorktreeOverlapReport | undefined {
-	const isolated = children.filter((child) => child.worktreeHandoff || child.worktreeRequested);
-	if (isolated.length < 2) return undefined;
-	return inspectWorktreeChanges(isolated);
-}
-
 /** Read-only snapshot of selected child evidence; never scans worktrees or invokes Git. */
 export function inspectWorktreeChanges(children: readonly WorkflowScriptChildResult[]): WorktreeOverlapReport {
 	const rows: WorktreeOverlapChild[] = [];
@@ -111,7 +104,7 @@ export function inspectWorktreeChanges(children: readonly WorkflowScriptChildRes
 			continue;
 		}
 		if (!handoffPath) {
-			rows.push({ ...identity, error: child.worktreeRequested ? "Isolated child returned no worktree handoff." : "Child has no managed-worktree handoff." });
+			rows.push({ ...identity, error: "Child has no managed-worktree handoff." });
 			continue;
 		}
 		try {
@@ -185,38 +178,4 @@ export function inspectWorktreeChanges(children: readonly WorkflowScriptChildRes
 		overlaps,
 		...reviewGroupsFor(rows, overlaps),
 	};
-}
-
-/** Keep chat output bounded; the full inventory stays in workflow.worktreeOverlaps. */
-export function formatWorktreeOverlaps(report: WorktreeOverlapReport | undefined): string {
-	if (!report) return "";
-	const unknown = report.children.filter((child) => child.paths === undefined);
-	const lines = [`Worktree file overlap analysis: ${report.state}.`];
-	lines.push(`${report.children.length - unknown.length}/${report.children.length} child patch inventories examined; ${report.disjointChildren.length} with no shared paths.`);
-	// Surface missing evidence before paths so long inventories cannot hide it.
-	for (const child of unknown.slice(0, 8)) lines.push(`Unexamined ${JSON.stringify(child.key)}: ${child.error}`);
-	if (unknown.length > 8) lines.push(`${unknown.length - 8} more unexamined child patches in workflow.worktreeOverlaps.`);
-	if (report.reviewGroups.length > 0) {
-		lines.push(`Review together (${report.reviewGroups.length} group(s), including indirect file overlap):`);
-		for (const group of report.reviewGroups.slice(0, 8)) lines.push(`  ${group.children.map((key) => JSON.stringify(key)).join(", ")} — ${group.sharedPaths.length} shared path(s)`);
-	}
-	if (report.overlaps.length > 0) {
-		lines.push(`${report.overlaps.length} shared file path(s); file overlap does not establish a merge conflict.`);
-		for (const overlap of report.overlaps.slice(0, 12)) {
-			lines.push(`- ${JSON.stringify(overlap.path)} in ${JSON.stringify(overlap.repoRoot)}: ${overlap.children.map((key) => JSON.stringify(key)).join(", ")}`);
-		}
-		if (report.overlaps.length > 12) lines.push(`- ${report.overlaps.length - 12} more shared paths in workflow.worktreeOverlaps.`);
-	} else {
-		lines.push(report.state === "complete" ? "No shared file paths found in the captured patches." : "No shared file paths found among the available inventories; remaining children are unexamined.");
-	}
-	const examined = report.children.filter((child) => child.paths !== undefined);
-	for (const child of examined.slice(0, 8)) {
-		const paths = child.paths!.slice(0, 4).map((file) => JSON.stringify(file)).join(", ");
-		lines.push(`Changes ${JSON.stringify(child.key)} (${child.paths!.length} path(s)): ${paths || "none"}${child.paths!.length > 4 ? ", …" : ""}`);
-		lines.push(`Patch ${JSON.stringify(child.key)}: ${JSON.stringify(child.patchPath)}; handoff: ${JSON.stringify(child.handoffPath)}`);
-	}
-	if (examined.length > 8) lines.push(`${examined.length - 8} more child inventories in workflow.worktreeOverlaps.`);
-	lines.push("Full changed-path inventory and patch references: workflow.worktreeOverlaps.");
-	const text = lines.join("\n");
-	return text.length <= 6_000 ? text : `${text.slice(0, 5_800)}\n[Overlap summary truncated; full inventory and references: workflow.worktreeOverlaps.]`;
 }

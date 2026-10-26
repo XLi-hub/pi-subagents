@@ -12,9 +12,64 @@ interface InspectionValue {
 	reviewKeys?: string[];
 }
 
+function makeInspectionExecutor(config: Record<string, unknown> = {}) {
+	return createSubagentExecutor!({
+		pi: { events: createEventBus(), getSessionName: () => undefined, sendMessage() {} },
+		state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+		config: { worktreeProvider: "native", ...config }, asyncByDefault: false, tempArtifactsDir: tempDir,
+		getSubagentSessionRoot: () => tempDir, expandTilde: (value: string) => value,
+		discoverAgents: () => ({ agents: [makeAgent("worker"), makeAgent("reviewer")] }),
+	});
+}
+
 describe("workflow-directed review of captured worktree changes", { skip: !available }, () => {
 	installAsyncExecutionHooks();
 	for (const background of [false, true]) {
+		it(`keeps captured inventories in handoffs without automatic reports (async=${background})`, async () => {
+			const repo = createRepo("pi-inspection-unqueried-");
+			for (const key of ["api", "ui"]) mockPi.onCall({ output: "Captured", writeFiles: [{ path: "shared.ts", content: `export const ${key} = true;\n` }] });
+			try {
+				const result = await makeInspectionExecutor().executePublic(`unqueried-${background}`, {
+					workflowScript: `return (await runs.all(["api", "ui"].map(key => ({ key, agent: "worker", task: "Write", cwd: args.repo, worktree: true, async: false })))).map(child => ({ key: child.key, ok: child.ok, handoff: child.worktreeHandoff }));`,
+					args: { repo }, async: background, output: false, mission: false, acceptance: false,
+				}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+				const payload = background ? await readAsyncPayload(result.details.asyncId!) : result.details;
+				const workflow = payload.workflow as { value: Array<{ key: string; ok: boolean; handoff: { path: string } }>; worktreeOverlaps?: unknown };
+				assert.equal(workflow.worktreeOverlaps, undefined);
+				assert.deepEqual(workflow.value.map(child => [child.key, child.ok]), [["api", true], ["ui", true]]);
+				for (const child of workflow.value) {
+					const manifest = JSON.parse(fs.readFileSync(child.handoff.path, "utf8"));
+					assert.deepEqual(manifest.groups[0].children[0].patch.paths, ["shared.ts"]);
+				}
+				assert.equal(mockPi.sessions.length, 2);
+			} finally {
+				fs.rmSync(repo, { recursive: true, force: true });
+				fs.rmSync(path.join(path.dirname(repo), "worktrees", path.basename(repo)), { recursive: true, force: true });
+			}
+		});
+		for (const query of [false, true]) {
+			it(`retains rejected batch keys without dispatching children (query=${query}, async=${background})`, async () => {
+				const repo = createRepo("pi-inspection-rejected-");
+				fs.writeFileSync(path.join(repo, "dirty.txt"), "dirty");
+				const executor = makeInspectionExecutor({ worktree: true });
+				try {
+					const result = await executor.executePublic(`rejected-${query}-${background}`, {
+						workflowScript: `const children = await runs.all(["api", "ui"].map(key => ({ key, agent: "worker", task: "Write", cwd: args.repo }))); return { ok: children.map(child => child.ok)${query ? ', changes: await runs.worktreeChanges(children.map(child => child.key))' : ""} };`,
+						args: { repo }, async: background, output: false, mission: false, acceptance: false,
+					}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+					const payload = background ? await readAsyncPayload(result.details.asyncId!) : result.details;
+					const workflow = payload.workflow as { value: { ok: boolean[]; changes?: WorktreeOverlapReport }; worktreeOverlaps?: unknown };
+					assert.deepEqual(workflow.value.ok, [false, false]);
+					assert.equal(workflow.worktreeOverlaps, undefined);
+					assert.equal(mockPi.sessions.length, 0);
+					if (query) {
+						assert.equal(workflow.value.changes?.state, "incomplete");
+						assert.deepEqual(workflow.value.changes?.children.map(child => child.key), ["api", "ui"]);
+						assert.ok(workflow.value.changes?.children.every(child => child.paths === undefined && /no managed-worktree handoff/.test(child.error ?? "")));
+					} else assert.equal(workflow.value.changes, undefined);
+				} finally { fs.rmSync(repo, { recursive: true, force: true }); }
+			});
+		}
 		for (const scenario of ["overlap", "disjoint", "missing-evidence", "failed-with-patch"] as const) {
 			it(`collects change evidence before launching the requested reviews (${scenario}, async=${background})`, async () => {
 				const repo = createRepo("pi-workflow-inspection-");
@@ -24,13 +79,7 @@ describe("workflow-directed review of captured worktree changes", { skip: !avail
 				if (scenario !== "missing-evidence") mockPi.onCall({ matchArgIncludes: "UI changes", output: "UI ready", ...(scenario === "failed-with-patch" ? { exitCode: 1, stderr: "Worker failed after capturing partial work" } : {}), writeFiles: [{ path: secondPath, content: "export const ui = true;\n" }] });
 				const expectedReviews = scenario === "overlap" ? 1 : scenario === "disjoint" ? 2 : 0;
 				for (let index = 0; index < expectedReviews; index++) mockPi.onCall({ matchArgIncludes: "INSPECTION-REVIEW", output: `Review ${index} completed` });
-				const executor = createSubagentExecutor!({
-					pi: { events: createEventBus(), getSessionName: () => undefined, sendMessage() {} },
-					state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
-					config: { worktreeProvider: "native" }, asyncByDefault: false, tempArtifactsDir: tempDir,
-					getSubagentSessionRoot: () => tempDir, expandTilde: (value: string) => value,
-					discoverAgents: () => ({ agents: [makeAgent("worker"), makeAgent("reviewer")] }),
-				});
+				const executor = makeInspectionExecutor();
 				try {
 					const ctx = { ...makeMinimalCtx(tempDir), modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] } };
 					const script = `
@@ -54,13 +103,13 @@ describe("workflow-directed review of captured worktree changes", { skip: !avail
 					const workflow = background ? payload!.workflow : result.details.workflow!;
 					const value = (blocked ? workflow.emits[0] : workflow.value) as InspectionValue;
 					assert.equal(value.changes.state, scenario === "missing-evidence" ? "incomplete" : "complete");
-					assert.deepEqual(value.changes, workflow.worktreeOverlaps, "explicit inspection and automatic completion use the same evidence projection");
+					assert.equal(workflow.worktreeOverlaps, undefined, "reports are retained only through the script return/emits");
 					const reviewCalls = mockPi.sessions.filter((session) => session.task?.includes("INSPECTION-REVIEW"));
 					assert.equal(reviewCalls.length, expectedReviews);
 					assert.equal(mockPi.sessions.length, scenario === "missing-evidence" ? 1 : 2 + expectedReviews);
 					if (scenario === "missing-evidence") {
 						assert.equal(value.state, "blocked");
-						assert.match(value.changes.children[1]?.error ?? "", /returned no worktree handoff/);
+						assert.match(value.changes.children[1]?.error ?? "", /no managed-worktree handoff/);
 					} else if (scenario === "failed-with-patch") {
 						assert.equal(value.state, "blocked");
 						assert.ok(fs.existsSync(value.changes.children[1]?.patchPath!));

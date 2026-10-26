@@ -22,7 +22,7 @@ function fixture(t: { after: (fn: () => void) => void }) {
 		};
 		fs.writeFileSync(handoffPath, JSON.stringify(manifest));
 		fs.writeFileSync(patchPath, "captured patch\n");
-		return { key, runId: `run-${key}`, ok: true, output: key, artifactPaths: [handoffPath], worktreeRequested: true,
+		return { key, runId: `run-${key}`, ok: true, output: key, artifactPaths: [handoffPath],
 			worktreeHandoff: { version: 1, path: handoffPath, groupCount: 1, childCount: 1, changedPatches: paths.length > 0 ? 1 : 0, cleanupState: "complete" } };
 	}
 	return { dir, child };
@@ -31,6 +31,26 @@ function fixture(t: { after: (fn: () => void) => void }) {
 const noStatus = async (): Promise<WorkflowScriptChildResult> => { throw new Error("Inspection must not widen into a status lookup."); };
 
 describe("runs.worktreeChanges", () => {
+	it("reads no handoffs when the workflow does not request inspection", async (t) => {
+		const { child } = fixture(t);
+		const values = [child("api", ["shared.ts"]), child("ui", ["shared.ts"])];
+		const files = new Set(values.map(value => value.worktreeHandoff!.path));
+		const fsCjs = createRequire(import.meta.url)("node:fs") as typeof fs;
+		const original = fsCjs.statSync;
+		let reads = 0;
+		const mock = t.mock.method(fsCjs, "statSync", ((...args: Parameters<typeof fs.statSync>) => {
+			if (files.has(String(args[0]))) reads++;
+			return Reflect.apply(original, fsCjs, args);
+		}) as typeof fs.statSync);
+		syncBuiltinESMExports();
+		t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+		const result = await runWorkflowScript({
+			script: `return (await runs.all(["api", "ui"].map(key => ({ key, agent: "worker", task: "Write" })))).map(child => child.ok);`,
+			async launch(key) { return values.find(value => value.key === key)!; }, status: noStatus,
+		});
+		assert.deepEqual(result.value, [true, true]);
+		assert.equal(reads, 0);
+	});
 	it("bounds cumulative selected-key inspections without charging rejected selections", async (t) => {
 		const { child } = fixture(t);
 		const run = () => runWorkflowScript({
