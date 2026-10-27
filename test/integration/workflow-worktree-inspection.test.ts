@@ -119,7 +119,8 @@ describe("workflow-directed review of captured worktree changes", { skip: !avail
 						for (const child of value.changes.children) {
 							assert.ok(fs.existsSync(child.patchPath!));
 							assert.match(fs.readFileSync(child.patchPath!, "utf8"), /export const/);
-							assert.ok(reviewCalls.some((session) => session.task?.includes(child.patchPath!)));
+							// References are embedded as JSON; Windows backslashes are escaped.
+							assert.ok(reviewCalls.some((session) => session.task?.includes(JSON.stringify(child.patchPath!))));
 						}
 						for (const session of reviewCalls) assert.equal(fs.realpathSync(session.launch.cwd), fs.realpathSync(repo));
 					}
