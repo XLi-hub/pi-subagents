@@ -18,7 +18,9 @@ import type { SteerDeliveryMode } from "../runs/background/control-channel.ts";
 import { stopAsyncRun } from "../runs/foreground/async-stop-action.ts";
 import { resolveWorkflowForegroundSteeringTarget, steerWorkflowForegroundTarget } from "../runs/foreground/workflow-foreground-steering.ts";
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
+import { foregroundChildStateLabel } from "../runs/foreground/foreground-history.ts";
 import { FLEET_STATUS_WIDGET_KEY, reportFleetWarning } from "./fleet-status.ts";
+import { stepTaskSummary } from "./render.ts";
 import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
 import { runningTone } from "./running-tone.ts";
 import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
@@ -84,7 +86,7 @@ type AsyncStep = AsyncRunSummary["steps"][number];
 export type FleetItem = (
 	| { key: string; kind: "foreground-active"; runId: string; index?: number; agent: string; state: "running"; updatedAt: number; control: ForegroundRunControl; activeChild?: ForegroundChildControl }
 	| { key: string; kind: "foreground-recent"; runId: string; index: number; agent: string; state: ForegroundResumeChild["status"]; updatedAt: number; run: ForegroundResumeRun; child: ForegroundResumeChild }
-	| { key: string; kind: "async"; runId: string; index?: number; agent: string; state: string; updatedAt: number; run: AsyncRunSummary; step?: AsyncStep }
+	| { key: string; kind: "async"; runId: string; index?: number; agent: string; state: string; updatedAt: number; run: AsyncRunSummary; step?: AsyncStep; task?: string }
 	| { key: string; kind: "external"; runId: string; agent: string; state: ExternalRun["state"]; updatedAt: number; run: ExternalRun }
 ) & { description?: string };
 
@@ -170,18 +172,22 @@ function asyncItems(run: AsyncRunSummary, description?: string): FleetItem[] {
 	if (run.steps.length === 0 || run.mode === "workflow") {
 		return [{ key: `async:${run.id}`, kind: "async", runId: run.id, agent: run.mode, state: run.state, updatedAt, run, ...(description ? { description } : {}) }];
 	}
-	return run.steps.map((step) => ({
-		key: `async:${run.id}:${step.index}`,
-		kind: "async" as const,
-		runId: run.id,
-		index: step.index,
-		agent: step.label ? `${step.label} (${step.agent})` : step.agent,
-		state: step.status,
-		updatedAt: step.lastActivityAt ?? updatedAt,
-		run,
-		step,
-		...(description ? { description } : {}),
-	}));
+	return run.steps.map((step) => {
+		const task = stepTaskSummary(step, step.agent);
+		return {
+			key: `async:${run.id}:${step.index}`,
+			kind: "async" as const,
+			runId: run.id,
+			index: step.index,
+			agent: step.label ? `${step.label} (${step.agent})` : step.agent,
+			state: step.status,
+			updatedAt: step.lastActivityAt ?? updatedAt,
+			run,
+			step,
+			...(task ? { task } : {}),
+			...(description ? { description } : {}),
+		};
+	});
 }
 
 function orderFleetAsyncRuns(runs: AsyncRunSummary[], terminalLimit: number, trackedJobs: Map<string, AsyncJobState>): AsyncRunSummary[] {
@@ -278,6 +284,7 @@ export function collectFleetSnapshot(
 				entryLimit: MAX_FLEET_HISTORY_CANDIDATES,
 				resultsDir: options.resultsDir ?? DIRS.results,
 				reconcile: false,
+				onCorruptStatus: (warning) => reportFleetWarning(state, warning),
 			}).filter((run) => !trackedIds.has(run.id));
 			runs = [...trackedRuns, ...history];
 		} else {
@@ -499,7 +506,7 @@ function foregroundRecentDetail(item: Extract<FleetItem, { kind: "foreground-rec
 	const lines = [
 		`Run: ${item.runId}`,
 		"Source: foreground",
-		`State: ${child.status}`,
+		`State: ${foregroundChildStateLabel(run, child)}`,
 		`Mode: ${run.mode}`,
 		`Child: ${child.index} (${child.agent})${contextModeLabel(child.context) ? ` ${contextModeLabel(child.context)}` : ""}`,
 		modelThinking ? `Model: ${modelThinking}` : undefined,
@@ -1261,8 +1268,11 @@ export class SubagentFleetComponent implements Component {
 			const item = this.snapshot.items[index]!;
 			const marker = index === this.selected ? this.theme.fg("accent", "›") : " ";
 			const context = item.kind === "async" ? contextModeBadge(this.theme, item.step?.context ?? item.run.context) : item.kind === "foreground-recent" ? contextModeBadge(this.theme, item.child.context) : "";
-			const agent = index === this.selected ? this.theme.bold(item.agent) : item.agent;
-			const identity = item.runId.slice(0, 8);
+			// A child's task tells rows of one run apart; the run id stays in the detail header.
+			const task = item.kind === "async" ? item.task : undefined;
+			const name = task && item.kind === "async" && item.step ? item.step.agent : item.agent;
+			const agent = index === this.selected ? this.theme.bold(name) : name;
+			const identity = task ?? item.runId.slice(0, 8);
 			const left = `${marker} ${statusGlyph(item, this.theme)} ${agent}${context} ${this.theme.fg("dim", `· ${identity}`)}`;
 			return rightAligned(left, this.theme.fg("dim", item.state), layout.roster.width);
 		});

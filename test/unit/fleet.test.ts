@@ -10,20 +10,41 @@ import { registerInspector } from "../../src/api/inspectors.ts";
 import { getInspectorPlugins, registerInspectorEventListener } from "../../src/inspectors/plugins.ts";
 import { EXTERNAL_RUN_REGISTRY_KEY, EXTERNAL_RUN_REGISTRY_VERSION, registerExternalRun } from "../../src/api/external-runs.ts";
 import { collectFleetSnapshot, openSubagentFleet, SubagentFleetComponent } from "../../src/tui/fleet.ts";
-import { persistForegroundRunHistory, restoreForegroundRunHistory } from "../../src/runs/foreground/foreground-history.ts";
+import { discardRunningForegroundRun, FOREGROUND_OWNER_EXITED_STOP_ERROR, persistForegroundRun, restoreForegroundRunHistory } from "../../src/runs/foreground/foreground-history.ts";
+import { resetBootIdForTesting } from "../../src/runs/background/boot-id.ts";
+import { currentPidNamespaceScope } from "../../src/runs/background/pid-namespace.ts";
+import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { spawnSync } from "node:child_process";
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
 import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
 import { registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
 import { createHerdrInspectorPlugin } from "../../src/inspectors/herdr/plugin.ts";
-import type { SubagentState } from "../../src/shared/types.ts";
+import type { ForegroundResumeRun, SubagentState } from "../../src/shared/types.ts";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
 
 function clearExternalRuns(): void {
 	delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_RUN_REGISTRY_KEY)];
+}
+
+function foregroundHistoryFile(resultsDir: string, runId: string): string {
+	return path.join(resultsDir, "foreground-history", `${encodeIndexSegment(runId)}.json`);
+}
+
+/** Writes a raw record as another Pi process, or an older version, would have left it. */
+function writeForegroundHistoryFile(resultsDir: string, run: { runId: string }): void {
+	fs.mkdirSync(path.join(resultsDir, "foreground-history"), { recursive: true });
+	fs.writeFileSync(foregroundHistoryFile(resultsDir, run.runId), JSON.stringify(run), "utf-8");
+}
+
+function savedForegroundRuns(resultsDir: string): Map<string, ForegroundResumeRun> {
+	const dir = path.join(resultsDir, "foreground-history");
+	const files = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+	return new Map(files.map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8")) as ForegroundResumeRun).map((run) => [run.runId, run]));
 }
 
 function stateForTest(): SubagentState {
@@ -55,6 +76,7 @@ function writeAsyncRun(root: string, input: {
 	contexts?: Array<"fresh" | "fork">;
 	models?: string[];
 	thinking?: string[];
+	descriptions?: string[];
 	output?: string;
 	transcript?: Array<Record<string, unknown>>;
 }): string {
@@ -78,6 +100,7 @@ function writeAsyncRun(root: string, input: {
 			...(input.contexts?.[index] ? { context: input.contexts[index] } : {}),
 			...(input.models?.[index] ? { model: input.models[index] } : {}),
 			...(input.thinking?.[index] ? { thinking: input.thinking[index] } : {}),
+			...(input.descriptions?.[index] ? { description: input.descriptions[index] } : {}),
 			status: input.state === "complete" ? "complete" : input.state === "failed" ? "failed" : index === 0 ? "running" : "pending",
 			startedAt: 100,
 			...(index === 0 ? { sessionFile: path.join(asyncDir, `${agent}.jsonl`), ...(transcriptPath ? { transcriptPath } : {}) } : {}),
@@ -563,6 +586,35 @@ describe("native subagent fleet", () => {
 		}
 	});
 
+	it("names each async child's task on its roster row and keeps the run id in the detail header", (t) => {
+		t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-row-task-"));
+		try {
+			writeAsyncRun(root, {
+				id: "row-task-run",
+				agents: ["worker", "worker"],
+				descriptions: [
+					"Fix login bug",
+					"Fix two Cycode Python SAST findings in entity-gov and add regression tests for both of the reported injection paths",
+				],
+			});
+			const component = new SubagentFleetComponent({ terminal: { rows: 32, columns: 140 }, requestRender() {} } as never, theme as never, stateForTest(), () => {}, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme });
+			try {
+				const lines = component.render(140);
+				const roster = lines.map((line) => line.split("│")[1] ?? "");
+				const short = roster.find((row) => row.includes("worker · Fix login bug"));
+				const long = roster.find((row) => row.includes("worker · Fix two Cycode"));
+				assert.ok(short, `short task row missing:\n${roster.join("\n")}`);
+				assert.ok(long, `long task row missing:\n${roster.join("\n")}`);
+				assert.ok(long.includes("..."), "a long task is cut to the row");
+				assert.ok(!long.includes("injection paths"));
+				assert.equal(visibleWidth(long), visibleWidth(short), "both rows keep the roster width");
+				assert.ok(!short.includes("row-task"), "the row shows the task instead of the run id");
+				assert.ok(lines.some((line) => (line.split("│")[2] ?? "").includes("row-task")), "the detail header still shows the run id");
+			} finally { component.dispose(); }
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("colors running Fleet rows by their child's recorded level, and whole runs by the main session's", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-levels-"));
 		setMainThinkingLevelSource(() => "xhigh");
@@ -913,9 +965,8 @@ describe("native subagent fleet", () => {
 				updatedAt: 300,
 				children: [{ agent: "outsider", index: 0, status: "completed", savedOutputPath: outputPath }],
 			});
-			persistForegroundRunHistory(state, { resultsDir });
-			const historyFile = path.join(resultsDir, "foreground-history.json");
-			if (process.platform !== "win32") assert.equal(fs.statSync(historyFile).mode & 0o777, 0o600);
+			for (const run of state.foregroundRuns!.values()) persistForegroundRun(run, { resultsDir });
+			if (process.platform !== "win32") assert.equal(fs.statSync(foregroundHistoryFile(resultsDir, "restored")).mode & 0o777, 0o600);
 
 			const restored = stateForTest();
 			restored.baseCwd = cwd;
@@ -949,28 +1000,9 @@ describe("native subagent fleet", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-terminal-"));
 		try {
 			const resultsDir = path.join(root, "results");
-			fs.mkdirSync(resultsDir, { recursive: true });
-			fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({
-				version: 1,
-				runs: [
-					{
-						runId: "stale-running",
-						mode: "single",
-						cwd: root,
-						sessionId: "session-current",
-						updatedAt: 300,
-						children: [{ agent: "worker", index: 0, status: "running", currentTool: "bash" }],
-					},
-					{
-						runId: "terminal",
-						mode: "single",
-						cwd: root,
-						sessionId: "session-current",
-						updatedAt: 200,
-						children: [{ agent: "reviewer", index: 0, status: "completed", finalOutput: "done" }],
-					},
-				],
-			}, null, 2), "utf-8");
+			// A running row without an owner pid cannot be judged, so it is never admitted.
+			writeForegroundHistoryFile(resultsDir, { runId: "stale-running", mode: "single", cwd: root, sessionId: "session-current", updatedAt: 300, children: [{ agent: "worker", index: 0, status: "running", currentTool: "bash" }] });
+			writeForegroundHistoryFile(resultsDir, { runId: "terminal", mode: "single", cwd: root, sessionId: "session-current", updatedAt: 200, children: [{ agent: "reviewer", index: 0, status: "completed", finalOutput: "done" }] });
 
 			const restored = stateForTest();
 			restored.baseCwd = root;
@@ -978,18 +1010,157 @@ describe("native subagent fleet", () => {
 			assert.deepEqual([...restored.foregroundRuns!.keys()], ["terminal"]);
 			assert.deepEqual(collectFleetSnapshot(restored).items.map((item) => item.key), ["foreground-recent:terminal:0"]);
 
-			const state = stateForTest();
-			state.foregroundRuns!.set("stale-running", {
-				runId: "stale-running",
-				mode: "single",
+			fs.rmSync(foregroundHistoryFile(resultsDir, "stale-running"));
+			persistForegroundRun({ runId: "stale-running", mode: "single", cwd: root, sessionId: "session-current", updatedAt: 400, children: [{ agent: "worker", index: 0, status: "running" }] }, { resultsDir });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()], ["terminal"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a running foreground record in the file and loads it as stopped only once its Pi process is gone", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-running-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "child-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const exited = spawnSync(process.execPath, ["-e", ""]).pid;
+			assert.ok(exited);
+			const running = (runId: string, owner: { pid: number; pidNamespaceScope?: string; bootId?: string }) => ({
+				runId,
+				mode: "single" as const,
 				cwd: root,
 				sessionId: "session-current",
-				updatedAt: 400,
-				children: [{ agent: "worker", index: 0, status: "running" as never }],
+				updatedAt: 100,
+				parentWorkflowRunId: "workflow-parent",
+				children: [{ agent: "worker", index: 0, status: "running" as const, activityState: "active" as const, currentTool: "bash", sessionFile, resumeContract: { outputMode: "inline" as const } }],
+				owner: { pidNamespaceScope: currentPidNamespaceScope(), ...owner },
 			});
-			persistForegroundRunHistory(state, { resultsDir });
-			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
-			assert.deepEqual(persisted.runs.map((run) => run.runId), ["terminal"]);
+			persistForegroundRun(running("owner-dead", { pid: exited }), { resultsDir });
+			persistForegroundRun(running("owner-alive", { pid: process.pid, bootId: "boot-now" }), { resultsDir });
+			// This test process is alive, so only the boot id can say this owner is gone.
+			persistForegroundRun(running("owner-rebooted", { pid: process.pid, bootId: "boot-before" }), { resultsDir });
+			persistForegroundRun(running("owner-other-namespace", { pid: exited, pidNamespaceScope: "pid:[container]" }), { resultsDir });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).values()].map((run) => [run.runId, run.children[0]?.status, run.owner !== undefined]).sort(), [
+				["owner-alive", "running", true], ["owner-dead", "running", true], ["owner-other-namespace", "running", true], ["owner-rebooted", "running", true],
+			]);
+
+			const restored = stateForTest();
+			restored.baseCwd = root;
+			resetBootIdForTesting(() => "boot-now");
+			try {
+				assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 2);
+			} finally {
+				resetBootIdForTesting();
+			}
+			assert.deepEqual([...restored.foregroundRuns!.keys()].sort(), ["owner-dead", "owner-rebooted"]);
+			const stopped = restored.foregroundRuns!.get("owner-dead")!;
+			assert.deepEqual(stopped.children[0], { agent: "worker", index: 0, status: "stopped", exitCode: 1, error: FOREGROUND_OWNER_EXITED_STOP_ERROR, finalOutput: FOREGROUND_OWNER_EXITED_STOP_ERROR, sessionFile, resumeContract: { outputMode: "inline" } });
+			assert.equal(stopped.owner, undefined);
+			assert.equal(stopped.parentWorkflowRunId, "workflow-parent");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("prunes the oldest final records beyond the cap, and a running record only once its owner is dead", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-prune-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const exited = spawnSync(process.execPath, ["-e", ""]).pid;
+			assert.ok(exited);
+			const run = (runId: string, ownerPid?: number): ForegroundResumeRun => ({ runId, mode: "single", cwd: root, sessionId: "session-current", updatedAt: 100, ...(ownerPid ? { owner: { pid: ownerPid } } : {}), children: [{ agent: "worker", index: 0, status: ownerPid ? "running" : "completed" }] });
+			// The two oldest files are running records: one whose owner is alive (its final save will
+			// replace it later) and one left by a Pi process that died.
+			for (const [index, [runId, ownerPid]] of ([["running-live", process.pid], ["running-dead", exited], ["final-1", undefined], ["final-2", undefined]] as const).entries()) {
+				persistForegroundRun(run(runId, ownerPid), { resultsDir });
+				fs.utimesSync(foregroundHistoryFile(resultsDir, runId), 1_000 + index, 1_000 + index);
+			}
+			persistForegroundRun(run("final-3"), { resultsDir, limit: 2 });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()].sort(), ["final-2", "final-3", "running-live"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("saves each foreground run to its own file without rewriting another process's record", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-own-file-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const run = (runId: string, extra: Partial<ForegroundResumeRun> = {}): ForegroundResumeRun => ({ runId, mode: "single", cwd: root, sessionId: "session-current", updatedAt: 100, children: [{ agent: "worker", index: 0, status: "completed" }], ...extra });
+			// Run A belongs to another Pi process: this process's state never held it.
+			persistForegroundRun(run("run-a", { owner: { pid: process.pid + 1 }, children: [{ agent: "worker", index: 0, status: "running" }] }), { resultsDir });
+			const fileA = foregroundHistoryFile(resultsDir, "run-a");
+			fs.utimesSync(fileA, 1_000, 1_000);
+			const bytesA = fs.readFileSync(fileA, "utf-8");
+			persistForegroundRun(run("run-b"), { resultsDir });
+			assert.equal(fs.readFileSync(fileA, "utf-8"), bytesA);
+			assert.equal(fs.statSync(fileA).mtimeMs, 1_000_000, "run A's file was not rewritten");
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()].sort(), ["run-a", "run-b"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("restores this session's saved runs, skips a corrupt file, and ignores and removes the old single history file", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-files-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const run = (runId: string, sessionId: string) => ({ runId, mode: "single" as const, cwd: root, sessionId, updatedAt: 100, children: [{ agent: "worker", index: 0, status: "completed" as const }] });
+			const legacyFile = path.join(resultsDir, "foreground-history.json");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(legacyFile, JSON.stringify({ version: 1, runs: [run("legacy", "session-current")] }), "utf-8");
+			persistForegroundRun(run("current", "session-current"), { resultsDir });
+			persistForegroundRun(run("other-session", "session-other"), { resultsDir });
+			fs.writeFileSync(path.join(resultsDir, "foreground-history", "corrupt.json"), "{not json", "utf-8");
+			assert.equal(fs.existsSync(legacyFile), false);
+
+			const restored = stateForTest();
+			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 1);
+			assert.deepEqual([...restored.foregroundRuns!.keys()], ["current"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("discards a running foreground record only while this process owns it", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-running-discard-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const running = (runId: string, ownerPid: number) => ({ runId, mode: "single" as const, cwd: root, sessionId: "session-current", updatedAt: 100, owner: { pid: ownerPid }, children: [{ agent: "worker", index: 0, status: "running" as const }] });
+			persistForegroundRun(running("threw", process.pid), { resultsDir });
+			persistForegroundRun(running("other-owner", process.pid + 1), { resultsDir });
+			discardRunningForegroundRun("threw", { resultsDir });
+			discardRunningForegroundRun("other-owner", { resultsDir });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()], ["other-owner"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows a foreground child cut off by a Pi exit as interrupted, with its resume id only when a transcript exists", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-interrupted-"));
+		try {
+			const sessionFile = path.join(root, "child-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const state = stateForTest();
+			state.baseCwd = root;
+			const interrupted = (runId: string, extra: { sessionFile?: string } = {}) => ({ runId, mode: "single" as const, cwd: root, sessionId: state.currentSessionId!, updatedAt: 100, children: [{ agent: "worker", index: 0, status: "stopped" as const, exitCode: 1, error: FOREGROUND_OWNER_EXITED_STOP_ERROR, finalOutput: FOREGROUND_OWNER_EXITED_STOP_ERROR, ...extra }] });
+			state.foregroundRuns!.set("run-interrupted", interrupted("run-interrupted", { sessionFile }));
+			const statusText = (id: string) => {
+				const status = inspectSubagentStatus({ id }, { asyncDirRoot: path.join(root, "runs"), resultsDir: path.join(root, "results"), state });
+				return status.content[0]?.type === "text" ? status.content[0].text : "";
+			};
+			assert.match(statusText("run-interrupted"), /^1\. worker interrupted when Pi exited · resume run-interrupted, exit 1/m);
+			const component = new SubagentFleetComponent({ terminal: { rows: 28, columns: 140 }, requestRender() {} } as never, theme as never, state, () => {}, { refreshMs: 60_000 });
+			try {
+				assert.ok(component.render(140).some((line) => line.includes("State: interrupted when Pi exited · resume run-interrupted")));
+			} finally {
+				component.dispose();
+			}
+
+			state.foregroundRuns!.set("run-no-transcript", interrupted("run-no-transcript"));
+			assert.match(statusText("run-no-transcript"), /^1\. worker interrupted when Pi exited, exit 1/m);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -999,36 +1170,15 @@ describe("native subagent fleet", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-contract-bound-"));
 		try {
 			const resultsDir = path.join(root, "results");
-			fs.mkdirSync(resultsDir, { recursive: true });
-			const oversizedContract = { outputSchema: { type: "object", description: "x".repeat(65 * 1024) } };
-			fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({
-				version: 1,
-				runs: [{
-					runId: "oversized",
-					mode: "single",
-					cwd: root,
-					sessionId: "session-current",
-					updatedAt: 200,
-					children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
-				}],
-			}), "utf-8");
+			const oversized = (runId: string) => ({ runId, mode: "single" as const, cwd: root, sessionId: "session-current", updatedAt: 200, children: [{ agent: "worker", index: 0, status: "completed" as const, resumeContract: { outputSchema: { type: "object", description: "x".repeat(65 * 1024) } } }] });
+			writeForegroundHistoryFile(resultsDir, oversized("saved-oversized"));
 
 			const restored = stateForTest();
 			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 0);
-			assert.equal(restored.foregroundRuns?.has("oversized"), false);
+			assert.equal(restored.foregroundRuns?.has("saved-oversized"), false);
 
-			const state = stateForTest();
-			state.foregroundRuns!.set("oversized", {
-				runId: "oversized",
-				mode: "single",
-				cwd: root,
-				sessionId: "session-current",
-				updatedAt: 200,
-				children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
-			});
-			persistForegroundRunHistory(state, { resultsDir });
-			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
-			assert.deepEqual(persisted.runs, []);
+			persistForegroundRun(oversized("oversized"), { resultsDir });
+			assert.equal(fs.existsSync(foregroundHistoryFile(resultsDir, "oversized")), false);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1055,7 +1205,12 @@ describe("native subagent fleet", () => {
 					children: [{ agent: "worker", index: 0, status: "completed", savedOutputPath: outputPath }],
 				});
 			}
-			persistForegroundRunHistory(state, { resultsDir, limit: 2 });
+			for (const [index, run] of [...state.foregroundRuns!.values()].entries()) {
+				persistForegroundRun(run, { resultsDir, limit: 2 });
+				// Distinct mtimes in save order: the cap prunes the oldest file.
+				fs.utimesSync(foregroundHistoryFile(resultsDir, run.runId), 1_000 + index, 1_000 + index);
+			}
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()].sort(), ["run-1", "run-2"]);
 			fs.rmSync(path.join(artifactsRoot, "outputs", "run-2", "output.md"), { force: true });
 
 			const restored = stateForTest();
