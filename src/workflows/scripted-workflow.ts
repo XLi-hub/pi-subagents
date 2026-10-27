@@ -6,6 +6,7 @@ import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/para
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import { describeGateAcceptanceConflict, parseGateInput } from "../runs/shared/acceptance.ts";
 import type { AcceptanceRecoveryMetadata, HostStepNode, SingleResult, WorkflowScriptFailureKind } from "../shared/types.ts";
+import { inspectWorktreeChanges } from "./worktree-overlaps.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -69,6 +70,8 @@ export interface WorkflowScriptChildResult {
 	outputReference?: string;
 	/** A file produced by the child runtime (output or worktree handoff), not its job directory. */
 	outputArtifactPath?: string;
+	/** Host-captured handoff for explicit keyed worktree inspection. */
+	worktreeHandoff?: import("../shared/types.ts").ParallelHandoffReference;
 	recovery?: AcceptanceRecoveryMetadata;
 	outputPathMapping?: { requestedPath: string; savedPath: string };
 	externalAdapter?: import("../shared/types.ts").ExternalCliReceiptMetadata;
@@ -1100,6 +1103,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const children = new Map<string, WorkflowScriptChildResult>();
 	const childOrder: string[] = [];
 	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
+	let worktreeInspectionKeys = 0;
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
 	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
 	const stoppedLaunches = new Set<string>();
@@ -1396,6 +1400,34 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return respond(Promise.reject(error));
 				}
 				return respond(Promise.resolve().then(() => options.state!.set(key, value)));
+			}
+
+			if (message.method === "worktreeChanges") {
+				const keys = message.args.keys;
+				if (!Array.isArray(keys) || keys.length > 64) return respond(Promise.reject(new Error("runs.worktreeChanges(keys) requires an array of at most 64 child keys.")));
+				const selected: WorkflowScriptChildResult[] = [];
+				try {
+					const unique = new Set<string>();
+					for (const value of keys) {
+						const key = validateKey(value, "runs.worktreeChanges");
+						if (unique.has(key)) throw new Error(`runs.worktreeChanges contains duplicate key '${key}'.`);
+						unique.add(key);
+					}
+					// Validate the complete selection before touching any artifact. Caller
+					// results and paths are never trusted as a source of child identity.
+					for (const key of unique) {
+						if (!launches.has(key)) throw new Error(`runs.worktreeChanges requires a prior runs.run/runs.all launch for '${key}'.`);
+						selected.push(children.get(key) ?? { key, ok: false, state: "running", output: "", artifactPaths: [] });
+					}
+				} catch (error) {
+					return respond(Promise.reject(error));
+				}
+				if (worktreeInspectionKeys + selected.length > 256) return respond(Promise.reject(new Error("runs.worktreeChanges exceeds the workflow limit of 256 selected-key inspections.")));
+				worktreeInspectionKeys += selected.length;
+				return respond(Promise.resolve().then(() => {
+					childController.signal.throwIfAborted();
+					return inspectWorktreeChanges(selected);
+				}), "runs.worktreeChanges result");
 			}
 
 			if (message.method === "status") {

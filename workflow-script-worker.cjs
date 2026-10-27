@@ -785,6 +785,7 @@ const runs = Object.freeze({
     return hostCall("steer", { key, message: message.trim(), options }, { key, operation: "steer" });
   },
   status(keyOrRunId) { return hostCall("status", { keyOrRunId }); },
+  worktreeChanges(keys) { return hostCall("worktreeChanges", { keys }); },
   ref: formatRef,
   refs(results) {
     if (!Array.isArray(results)) throw new Error("runs.refs(results) requires an array.");

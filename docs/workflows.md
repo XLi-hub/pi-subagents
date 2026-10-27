@@ -79,7 +79,7 @@ The `workflow` field selects the script source:
 
 `workflow: true` works only from a model tool call. Slash commands, RPC, and schedules pass scripts through their own inputs. Examples below that show only a ```` ```js workflow ```` block run with `subagent({ workflow: true })` in the same reply.
 
-For multi-step or parallel work, make exactly one top-level `subagent` workflow call with `async:true` and launch children only inside it. Read this guide for recipes rather than constructing a second top-level orchestration. Available sandbox helpers include `runs.run`, `runs.all`, `runs.lanes`, `runs.steer`, `runs.status`, `runs.ref`/`runs.refs`, `emit`, `console`, standard JavaScript, and mission `state` when enabled. No filesystem, shell, arbitrary Pi tools, or host globals are available; named resources alone may grant `runs.host` authority.
+For multi-step or parallel work, make exactly one top-level `subagent` workflow call with `async:true` and launch children only inside it. Read this guide for recipes rather than constructing a second top-level orchestration. Available sandbox helpers include `runs.run`, `runs.all`, `runs.lanes`, `runs.steer`, `runs.status`, `runs.worktreeChanges`, `runs.ref`/`runs.refs`, `emit`, `console`, standard JavaScript, and mission `state` when enabled. No filesystem, shell, arbitrary Pi tools, or host globals are available; named resources alone may grant `runs.host` authority.
 
 Workflow-level child controls default onto each `runs.run`/`runs.all` launch; explicit child fields override them. See [retained children](tool-reference.md#retained-children) for follow-up challenges, [output binding](tool-reference.md#output-mode-details) for durable artifacts, and [schedules](missions.md#schedules) for delayed/recurring scripts.
 
@@ -484,6 +484,52 @@ Use `baseRef` to branch managed worktrees from `HEAD` or a supported named ref s
 Configure the worktree provider, native path layout, base directory, and setup hook in [configuration.md](configuration.md).
 
 Setup waits remain nonblocking and cancellable. Normal cleanup, including detached foreground finalization, waits for the same in-process setup turn rather than retaining worktrees merely because another setup is active. This is not a cross-process lock. Hooks must follow the [finite setup contract](configuration.md#worktreesetuphook).
+
+### Inspect worktree changes inside a workflow
+
+Use `await runs.worktreeChanges(keys)` after awaiting writing children when the script needs their captured file inventories before it finishes. The query groups captured patches by exact shared paths so the script can explicitly launch one reviewer per group:
+
+Use ordinary `runs.run`/`runs.all` results when child success and output references are sufficient. This query addresses a narrower gap: raw workflow scripts cannot read handoff files, `runs.status` does not return a changed-path inventory, and raw scripts cannot authorize arbitrary `runs.host` commands. A separate reader child would spend another model launch to interpret already captured host metadata. Parent-side inspection after completion remains sufficient when no in-script follow-up is needed.
+
+```js workflow
+const writers = await runs.all([
+  { key: "api", agent: "worker", task: "Implement the API change", worktree: true },
+  { key: "ui", agent: "worker", task: "Implement the UI change", worktree: true }
+]);
+const changes = await runs.worktreeChanges(writers.map(child => child.key));
+if (writers.some(child => !child.ok) || changes.state !== "complete") {
+  emit({ state: "blocked", writers: writers.map(child => ({ key: child.key, ok: child.ok })), changes });
+  throw new Error("Writing failed or captured evidence is incomplete; no reviews launched.");
+}
+const groups = [
+  ...changes.reviewGroups.map(group => group.children),
+  ...changes.disjointChildren.map(key => [key])
+];
+const reviews = await runs.all(groups.map((keys, index) => ({
+  key: "review-" + index,
+  agent: "reviewer",
+  worktree: false,
+  task: "Review these captured patches together. Read-only; return findings only. Do not edit files.\n" + JSON.stringify(
+    changes.children.filter(child => keys.includes(child.key)).map(child => ({
+      key: child.key, patchPath: child.patchPath, handoffPath: child.handoffPath
+    }))
+  )
+})));
+const outcome = { changes, reviews: reviews.map(child => ({ key: child.key, ok: child.ok, output: child.output })) };
+emit(outcome);
+if (reviews.some(child => !child.ok)) throw new Error("A review failed; inspect the saved child evidence.");
+return outcome;
+```
+
+The helper accepts up to 64 unique keys already launched in the current workflow. An empty array returns an empty complete report; one key returns that child's inventory. Unknown keys, run ids used in place of keys, duplicate keys, sparse entries, and path/object inputs fail before any handoff is read. The host uses its own stored child results; changing a result object in the script cannot redirect inspection to another path.
+
+One workflow may inspect at most 256 selected keys cumulatively (for example, four full 64-key snapshots). Rejected selections and empty queries do not consume that allowance. The limit prevents repeated synchronous artifact reads from becoming an unbounded polling loop; wait for writers through their existing run promises. Each snapshot accepts handoffs up to 2 MiB each and reads at most 8 MiB in aggregate. It admits at most 20,000 paths / 2 MiB of path text, with a separate 4 MiB accounting budget for repeated JSON-escaped repository/key/path references. A workflow key must identify exactly one captured patch; composite handoffs stay unexamined. Patch availability is checked through a readable descriptor without reading its contents; changed patches require a nonempty regular file and consistent path metadata.
+
+The report contains each selected child's repository/base identity, exact paths, and patch/handoff references. `reviewGroups` are transitive sets connected by exact path overlap in the same repository; `disjointChildren` contains examined patches with no shared paths. Neither establishes semantic independence, merge order, or conflict freedom. Every selected key stays visible, including launches rejected before handoff capture. Missing or unrepresentable paths make the report incomplete.
+
+Inspection happens only on this explicit query. The workflow does not recompute or persist a second report at completion, or append automatic overlap text to status/chat. Return or emit the report (or a small chosen projection) when it should be retained; avoid returning the full inventory when only counts/references are needed.
+
+This is a snapshot, not a wait or a retry: pending, explicit async, paused, missing-evidence, and non-isolated children are unexamined and make it `incomplete`. A failed child can still have a complete captured inventory; check child `ok` separately before continuing the workflow, as the example does. Await each writing launch before inspection, and keep observing every stored run promise; querying its metadata does not await that launch for you. The helper launches no children or commands, changes no worktree state, and adds no filesystem access to the sandbox. The reviewers in the example run because the script explicitly requests them.
 
 ### Lane metadata lifecycle
 
