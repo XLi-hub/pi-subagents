@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fsDefault, * as fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -16,7 +17,7 @@ import { missionObserverIndexPath, resultPayloadPathForMissionObserverRun, write
 import { tryLease } from "../../src/shared/file-lease.ts";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
 import { createScheduledRunManager, scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
-import { prepareMissionLaunch, writeMissionAsyncBinding } from "../../src/missions/lifecycle.ts";
+import { prepareMissionLaunch, readMissionBinding, writeMissionAsyncBinding } from "../../src/missions/lifecycle.ts";
 import { readMission, updateMission } from "../../src/missions/store.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
@@ -269,6 +270,39 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("delivers a result once when the Pi process that launched it has exited, and keeps one from a live Pi", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-dead-owner-"));
+		try {
+			const state = createState();
+			state.currentSessionId = "session-reopened";
+			const delivered: Array<{ id?: string; completionOwnerId?: string | null }> = [];
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				ownership: createResultDeliveryOwnership(state),
+				notifier: { async deliver(result) { delivered.push({ id: result.id, completionOwnerId: result.completionOwnerId }); return true; } },
+			});
+			const exitedPid = spawnSync(process.execPath, ["-e", ""]).pid;
+			const write = (id: string, data: Record<string, unknown>) => writeAsyncResultFile(path.join(resultsDir, `${id}.json`), { id, sessionId: "session-reopened", success: true, summary: id, ...data });
+			write("exited-owner", { completionOwnerId: "owner-exited", completionOwnerProcess: { pid: exitedPid } });
+			write("live-owner", { completionOwnerId: "owner-live", completionOwnerProcess: { pid: process.pid } });
+			write("workflow-child", { completionOwnerId: "owner-exited-workflow", completionOwnerProcess: { pid: exitedPid }, parentWorkflowRunId: "workflow-1" });
+			write("other-session", { sessionId: "session-other", completionOwnerId: "owner-exited-other", completionOwnerProcess: { pid: exitedPid } });
+			try {
+				await watcher.deliverPendingResults();
+				await watcher.deliverPendingResults();
+				assert.deepEqual(delivered, [{ id: "exited-owner", completionOwnerId: "owning-session" }]);
+				assert.equal(fs.existsSync(path.join(resultsDir, "exited-owner.json")), false);
+				assert.equal(fs.existsSync(path.join(resultsDir, "live-owner.json")), true);
+				assert.equal(fs.existsSync(path.join(resultsDir, "workflow-child.json")), true);
+				assert.equal(fs.existsSync(path.join(resultsDir, "other-session.json")), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("includes scheduled observer ids while priming current-session results", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-current-prime-"));
 		try {
@@ -450,6 +484,69 @@ describe("result watcher", () => {
 			assert.ok(child?.artifactPaths.includes(outputPath));
 			assert.ok(child?.artifactPaths.includes(path.join(asyncDir, "status.json")));
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds corrupt mission completion diagnostics while preserving retry and targeted errors", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-corrupt-mission-"));
+		const resultsDir = path.join(root, "results");
+		const asyncDir = path.join(root, "async");
+		const project = path.join(root, "project");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.mkdirSync(project, { recursive: true });
+		const originalError = console.error;
+		const errors: unknown[][] = [];
+		try {
+			const binding = prepareMissionLaunch({
+				params: { mission: { title: "Corrupt mission", objective: "Keep evidence" } },
+				projectRoot: project,
+				config: { directory: path.join(root, "missions"), globalIndexDir: path.join(root, "global-index") },
+				ownerSessionId: "session-current",
+			});
+			assert.ok(binding);
+			writeMissionAsyncBinding(asyncDir, binding);
+			const bindingPath = path.join(asyncDir, "mission.json");
+			const corruptBinding = Buffer.from([0, 0, 0]);
+			fs.writeFileSync(bindingPath, corruptBinding);
+			assert.throws(() => readMissionBinding(asyncDir), /Invalid mission binding file/);
+			const resultPath = path.join(resultsDir, "corrupt-binding.json");
+			writeIndexedResult(resultPath, { id: "corrupt-binding", runId: "corrupt-binding", sessionId: "session-current", asyncDir, state: "complete", success: true });
+			console.error = (...args: unknown[]) => { errors.push(args); };
+			const syncFailures = (file: string) => errors.filter((args) => String(args[0]).includes("Mission completion sync failed") && String(args[0]).includes(file)).length;
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				notifier: { deliver: async () => true },
+			});
+			try {
+				await watcher.deliverPendingResults();
+				await watcher.deliverPendingResults();
+				assert.equal(syncFailures("corrupt-binding.json"), 1, "an unchanged corrupt binding is diagnosed once across retries");
+				assert.equal(fs.existsSync(resultPath), true, "corrupt mission completion stays unacknowledged and retryable");
+				assert.deepEqual(fs.readFileSync(bindingPath), corruptBinding);
+				fs.writeFileSync(bindingPath, JSON.stringify({
+					schemaVersion: 1,
+					missionId: binding.missionId,
+					projectRoot: binding.location.projectRoot,
+					missionDir: binding.location.missionDir,
+					globalIndexDir: binding.location.globalIndexDir,
+					writeGlobalIndex: binding.location.writeGlobalIndex,
+				}));
+				const missionPath = path.join(binding.location.missionDir, `${binding.missionId}.json`);
+				const mission = fs.readFileSync(missionPath);
+				fs.writeFileSync(missionPath, corruptBinding);
+				await watcher.deliverPendingResults();
+				assert.equal(fs.existsSync(resultPath), true, "a corrupt mission record also keeps the completion retryable");
+				fs.writeFileSync(missionPath, mission);
+				await watcher.deliverPendingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true, "the repaired record retries and is reconciled");
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			console.error = originalError;
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});

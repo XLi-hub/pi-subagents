@@ -997,6 +997,33 @@ Advise only.
 		assert.match(readText(chainResult), /Durable chain definitions were removed/);
 	});
 
+	it("rejects an unknown thinking level without writing the agent file", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const filePath = path.join(tempDir, ".pi", "agents", "thinker.md");
+		const created = handleCreate({ config: { name: "thinker", description: "Think", scope: "project", thinking: "hgih" } }, ctx);
+		assert.equal(created.isError, true);
+		assert.match(readText(created), /config\.thinking must be one of off, minimal, low, medium, high, xhigh, max, or false/);
+		assert.equal(fs.existsSync(filePath), false);
+
+		assert.equal(handleCreate({ config: { name: "thinker", description: "Think", scope: "project", thinking: "high" } }, ctx).isError, false);
+		const before = fs.readFileSync(filePath, "utf-8");
+		assert.match(before, /^thinking: high$/m);
+		assert.equal(handleUpdate({ agent: "thinker", config: { thinking: "hgih" } }, ctx).isError, true);
+		assert.equal(fs.readFileSync(filePath, "utf-8"), before);
+	});
+
+	it("saves an explicit thinking: off on create and on a padded update", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		assert.equal(handleCreate({ config: { name: "quiet", description: "Quiet", scope: "project", thinking: "off" } }, ctx).isError, false);
+		assert.match(fs.readFileSync(path.join(agentsDir, "quiet.md"), "utf-8"), /^thinking: off$/m);
+		assert.match(readText(handleManagementAction("get", { agent: "quiet" }, ctx)), /Thinking: off/);
+
+		assert.equal(handleCreate({ config: { name: "loud", description: "Loud", scope: "project", thinking: "high" } }, ctx).isError, false);
+		assert.equal(handleUpdate({ agent: "loud", config: { thinking: " off " } }, ctx).isError, false);
+		assert.match(fs.readFileSync(path.join(agentsDir, "loud.md"), "utf-8"), /^thinking: off$/m);
+	});
+
 	it("creates, updates, reports, clears, and validates acceptance roles", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const created = handleCreate(
