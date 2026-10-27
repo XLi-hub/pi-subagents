@@ -11,7 +11,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { ChildSession, ChildSessionFactory, ChildSessionLaunch } from "../../src/runs/shared/child-session.ts";
 import { boundedHerdrReconnect, BridgeChannel, createPlacementAwareChildSessionFactory, HerdrPiSession, reconnectHerdrPiSession, serializeHerdrPiLaunch, type HerdrRunIdentity } from "../../src/runs/shared/herdr-placed-run.ts";
-import { HERDR_MAX_OWNED_PANES, HerdrPlacedRunOwner, ownsHerdrPane, parseHerdrAgent, parseHerdrCreated, parseHerdrSessionSnapshot, provisionHerdrPane } from "../../src/runs/shared/herdr-pane-host.ts";
+import { HERDR_MAX_OWNED_PANES, herdrPaneHost, HerdrPlacedRunOwner, ownsHerdrPane, parseHerdrAgent, parseHerdrCreated, parseHerdrSessionSnapshot, provisionHerdrPane } from "../../src/runs/shared/herdr-pane-host.ts";
 import { herdrPaneAllocationKey, withHerdrPaneAllocationLock } from "../../src/runs/shared/placement-host.ts";
 import { HerdrPiFrameDecoder, encodeHerdrPiFrame, HERDR_PI_MAX_FRAME_BYTES, HERDR_PI_MODE_ENV, HERDR_PI_RUN_ENV, HERDR_PI_RUNTIME_DIR_ENV } from "../../src/runs/shared/herdr-pi-protocol.ts";
 import { parseHerdrEndpoint } from "../../src/runs/shared/herdr-connection.ts";
@@ -20,6 +20,9 @@ import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-l
 import { runChildSession } from "../../src/runs/background/run-child-session.ts";
 import { getAgentDir } from "../../src/shared/utils.ts";
 import registerHerdrPiBridge, { resolveRemoteHerdrResources } from "../../src/extension/herdr-pi-bridge.ts";
+import { executeAsyncSingle } from "../../src/runs/background/async-execution.ts";
+import { DIRS } from "../../src/shared/types.ts";
+import { makeAgent } from "../support/helpers.ts";
 
 const machine = { provider: "herdr" as const, id: "m1", label: "workmac", target: "remote.example", cwd: "/remote/repo" };
 const runtime = { runId: "run", agent: "worker", childIndex: 0, fanoutChild: false, depth: 1, maxDepth: 1, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false, fast: false, waitTool: { enabled: true } };
@@ -63,7 +66,7 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		assert.equal(seen?.cwd, "/remote/repo");
 	});
 
-	it("rejects unrepresented required and MCP tool contracts at the public factory boundary before provisioning", async () => { let provisioned = 0; const factory = createPlacementAwareChildSessionFactory({ async create() { return child; }, async dispose() {} }, async () => { provisioned++; return child; }); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, requiredTools: ["required_missing"] } }), /required-tool/u); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, mcpDirectTools: ["mcp_tool"] } }), /MCP direct tools/u); assert.equal(provisioned, 0); });
+	it("rejects MCP tool contracts at the public factory boundary before provisioning, and leaves required tools to the remote acknowledgement", async () => { let provisioned = 0; const factory = createPlacementAwareChildSessionFactory({ async create() { return child; }, async dispose() {} }, async () => { provisioned++; return child; }); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, mcpDirectTools: ["mcp_tool"] } }), /MCP direct tools/u); assert.equal(provisioned, 0); await factory.create({ ...launch(true), runtime: { ...runtime, requiredTools: ["read"] } }); assert.equal(provisioned, 1); });
 
 	it("propagates resolved placement into the detached native child launch", () => {
 		const built = buildRunnerChildLaunch({ agent: "worker", task: "inspect", machine, cwd: machine.cwd, tools: ["read"], inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false }, { cwd: "/local/repo", id: "run-route", flatIndex: 0 }, { sessionEnabled: true, watchdogStatus() {} });
@@ -78,12 +81,45 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		assert.equal("tools" in wire, false); assert.doesNotMatch(JSON.stringify(wire), /remote\.example|\/local\/repo|callback|token/iu);
 		assert.deepEqual(serializeHerdrPiLaunch({ ...clean, remoteResources: { ...clean.remoteResources!, reads: ["remote-only.md"] } }).resources.reads, ["remote-only.md"]);
 		assert.doesNotMatch(JSON.stringify(wire), /LOCAL_SECRET_PROMPT|Users\/local/u);
-		assert.throws(() => serializeHerdrPiLaunch({ ...clean, storage: { kind: "file", sessionFile: "/local/session.jsonl" } }), /fork, resume, or revival/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, extensionPaths: ["/local/private.ts"] }), /cannot transfer local extension paths/u);
 		assert.doesNotMatch(JSON.stringify(serializeHerdrPiLaunch({ ...clean, hooks: [{ name: "local", factory() {} }] })), /callback|factory|local/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, runtime: { ...runtime, nestedRoute: { rootRunId: "r", eventSink: "/local/events", controlInbox: "/local/control", capabilityToken: "SECRET" } } }), /Nested delegation/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, processEnv: { MCP_DIRECT_TOOLS: "local-server" } }), /bindings, MCP selections, or process environment/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, runtime: { ...runtime, permissions: { rules: { bash: "deny" } } as never } }), /permission rules/u);
+	});
+
+	it("launches a fresh placed child that was given a local session path, and refuses one that would restore a transcript", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "placed-session-"));
+		try {
+			const sessionFile = path.join(root, "run-0", "session.jsonl");
+			const build = () => buildRunnerChildLaunch({ agent: "worker", task: "inspect", machine, cwd: machine.cwd, sessionFile, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false }, { cwd: "/local/repo", id: "run-fresh", flatIndex: 0 }, { sessionEnabled: true, watchdogStatus() {} }).session;
+			assert.equal(serializeHerdrPiLaunch(build()).resources.agent, "worker");
+			fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "forked" })}\n`);
+			assert.throws(() => serializeHerdrPiLaunch(build()), /fork, resume, or revival/u);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses up front to revive a transcript onto a machine", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "placed-revival-"));
+		const runId = `placed-revival-${Date.now().toString(36)}`;
+		try {
+			const sessionFile = path.join(root, "sessions", "run-0", "session.jsonl");
+			const result = executeAsyncSingle(runId, {
+				agent: "worker", task: "Continue", agentConfig: makeAgent("worker", { machine: "workmac" }),
+				ctx: { pi: { events: { emit() {} } }, cwd: root, currentSessionId: "placed-revival" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(root, "sessions"), maxSubagentDepth: 1,
+				sessionFile,
+				revivalLease: { sessionFile, runId, sourceRunId: "placed-source" },
+			});
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /does not support fork, resume, or revival/u);
+			assert.equal(fs.existsSync(path.join(DIRS.async, runId)), false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("parses literal tagged Herdr 0.9 success envelopes", () => {
@@ -115,7 +151,7 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 	it("starts immediately with one owner RPC and retains the exact requested argv", async () => { const methods: string[] = [], connection = { client: { async call(method: string) { methods.push(method); return { type: "agent_started", agent: { terminal_id: "term", pane_id: "pane" } }; } } }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)({ id: "m", target: "host", cwd: "/repo" }, "run", "/tmp/pi-subagents-herdr-owned", connection, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "pane" }; const started = await owner.start("claude", "a", ["--restricted"]); assert.deepEqual(methods, ["agent.start"]); assert.deepEqual(started.argv, ["claude", "--restricted"]); assert.deepEqual(owner.startedArgv, started.argv); });
 	it("ignores the superseded connection's disconnect callback during replacement", async () => { let lost!: (error: Error) => void, disconnected = 0; const original = { client: { async subscribe(filters: unknown, _listener: unknown, onDisconnect: (error: Error) => void) { assert.deepEqual(filters, [{ type: "pane.agent_status_changed", pane_id: "p" }, { type: "pane.closed" }, { type: "pane.moved" }]); lost = onDisconnect; return () => {}; } }, async close() { lost(new Error("superseded connection closed")); } }, replacement = { client: {}, async close() {} }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)(machine, "stale-disconnect", "/tmp/pi-subagents-herdr-stale", original, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "p" }; await owner.subscribe(() => {}, () => { disconnected++; }); await owner.replaceConnection({ connection: replacement as never, unsubscribe: () => {}, paneId: "p", state: "ready" }); assert.equal(disconnected, 0); assert.equal(owner.snapshot.connection, "connected"); });
 	it("rejects an initial subscription lost after acknowledgement but before adoption", async () => { let starts = 0, stops = 0; const connection = { client: { async subscribe(_filters: unknown, _listener: unknown, lost: (error: Error) => void) { lost(new Error("post-ack loss")); return () => { stops++; }; } } }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)(machine, "initial-race", "/tmp/pi-subagents-herdr-race", connection, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "p" }; await assert.rejects(owner.subscribe(() => {}, () => { starts++; }), /post-ack loss/u); assert.equal(starts, 0); assert.equal(stops, 1); assert.equal(owner.snapshot.connection, "connected"); });
-	it("never adopts a Pi reconnect candidate lost before subscribe returns", async () => { const identity: HerdrRunIdentity = { runId: "run_12345678", machineId: "m1", target: "remote", session: null, workspaceId: "w", tabId: "t", paneId: "p", terminalId: "term", agentName: "pi-r", nativeSessionId: "native", cwd: "/remote", runtimeDir: "/tmp/run" }; let connects = 0, closes = 0, replacements = 0; const fakeSession = { identity, evidenceCursor: 0, placementSnapshot: { connection: "unknown" }, observeHerdr() {}, reconnect() {}, async replaceTransport() { replacements++; } } as never; const fakeBridge = () => ({ frames: [], failure: new Promise<never>(() => {}), listeners: { add(listener: (frame: unknown) => void) { listener({ type: "ready", configured: true, runId: identity.runId, nativeSessionId: identity.nativeSessionId, packageVersion, protocol: 1, evidenceCursor: 0, evidenceFloor: 0 }); }, delete() {} }, close() {} }) as never; const connect = async () => { connects++; return { endpoint: { session: null, protocol: 22, version: "0.9.0" }, client: { async call() { return { type: "session_snapshot", snapshot: { agents: [{ terminal_id: "term", pane_id: "p", agent_status: "idle" }] } }; }, async subscribe(_filters: unknown, _listener: unknown, lost: (error: Error) => void) { lost(new Error("post-ack Pi loss")); return () => {}; } }, async forwardRemoteSocket() { return { socketPath: "/unused", async close() {} }; }, async close() { closes++; } }; }; await assert.rejects(reconnectHerdrPiSession(fakeSession, { ...launch(true), machine: { ...machine, cwd: "/remote" } }, { connect: connect as never, discoverManifest: (() => ({ socketPath: "/remote/bridge", nativeSessionId: "native", packageVersion, protocol: 1 })) as never, createBridge: fakeBridge }), /post-ack Pi loss/u); assert.equal(replacements, 0); assert.equal(connects, 3); assert.equal(closes, 3); });
+	it("never adopts a Pi reconnect candidate lost before subscribe returns", async () => { const identity: HerdrRunIdentity = { runId: "run_12345678", machineId: "m1", target: "remote", session: null, workspaceId: "w", tabId: "t", paneId: "p", terminalId: "term", agentName: "pi-r", nativeSessionId: "native", cwd: "/remote", runtimeDir: "/tmp/run" }; let connects = 0, closes = 0, replacements = 0; const fakeSession = { identity, evidenceCursor: 0, placementSnapshot: { connection: "unknown" }, host: herdrPaneHost, reconnect() {}, async replaceTransport() { replacements++; } } as never; const fakeBridge = () => ({ frames: [], failure: new Promise<never>(() => {}), listeners: { add(listener: (frame: unknown) => void) { listener({ type: "ready", configured: true, runId: identity.runId, nativeSessionId: identity.nativeSessionId, packageVersion, protocol: 1, evidenceCursor: 0, evidenceFloor: 0 }); }, delete() {} }, close() {} }) as never; const connect = async () => { connects++; return { endpoint: { session: null, protocol: 22, version: "0.9.0" }, client: { async call() { return { type: "session_snapshot", snapshot: { agents: [{ terminal_id: "term", pane_id: "p", agent_status: "idle" }] } }; }, async subscribe(_filters: unknown, _listener: unknown, lost: (error: Error) => void) { lost(new Error("post-ack Pi loss")); return () => {}; } }, async forwardRemoteSocket() { return { socketPath: "/unused", async close() {} }; }, async close() { closes++; } }; }; await assert.rejects(reconnectHerdrPiSession(fakeSession, { ...launch(true), machine: { ...machine, cwd: "/remote" } }, { connect: connect as never, discoverManifest: (() => ({ socketPath: "/remote/bridge", nativeSessionId: "native", packageVersion, protocol: 1 })) as never, createBridge: fakeBridge }), /post-ack Pi loss/u); assert.equal(replacements, 0); assert.equal(connects, 3); assert.equal(closes, 3); });
 	it("closes each adopted transport resource once when disposal races replacement", async () => { const identity: HerdrRunIdentity = { runId: "run_12345678", machineId: "m1", target: "remote", session: null, workspaceId: "w", tabId: "t", paneId: "p", terminalId: "term", agentName: "pi-r", nativeSessionId: "native", cwd: "/remote", runtimeDir: "/tmp/run" }; let releaseOld!: () => void, oldCloseStarted!: () => void, connectionCloses = 0, bridgeForwardCloses = 0, bridgeCloses = 0, unsubscribes = 0, cleanupCalls = 0; const oldClosePending = new Promise<void>((resolve) => { releaseOld = resolve; }), oldCloseEntered = new Promise<void>((resolve) => { oldCloseStarted = resolve; }); const adoptedBridge = { adopt: () => [], close() { bridgeCloses++; } } as unknown as BridgeChannel; const connection = { async close() { connectionCloses++; } } as never; let cleanupPromise: Promise<void> | undefined; const owner = { identity, connection: { async close() {} }, unsubscribe: () => {}, snapshot: { connection: "connected", state: "ready", identity, revision: 0 }, async replaceConnection(input: { connection: typeof connection; unsubscribe: () => void }) { const old = this.connection; this.connection = input.connection; this.unsubscribe = input.unsubscribe; await old.close(); }, cleanup() { return cleanupPromise ??= (async () => { cleanupCalls++; this.unsubscribe(); await this.connection.close(); })(); } } as unknown as HerdrPlacedRunOwner; const session = new HerdrPiSession(owner, { close: async () => { oldCloseStarted(); await oldClosePending; } }, { adopt: () => [], close() {} } as unknown as BridgeChannel, undefined, undefined, runtime); const replacing = session.replaceTransport({ connection, bridgeForward: { async close() { bridgeForwardCloses++; } }, bridge: adoptedBridge, unsubscribe() { unsubscribes++; }, paneId: "p2", cursor: 0, state: "working" }); await oldCloseEntered; await session.dispose(); releaseOld(); await replacing; assert.deepEqual({ connectionCloses, bridgeForwardCloses, bridgeCloses, unsubscribes, cleanupCalls }, { connectionCloses: 1, bridgeForwardCloses: 1, bridgeCloses: 1, unsubscribes: 1, cleanupCalls: 1 }); });
 	it("retries the identical start only after a transient rejection and fresh unoccupied pane proof", async () => { const methods: string[] = []; let starts = 0, now = 0; const connection = { client: { async call(method: string, params: unknown) { methods.push(method); if (method === "pane.get") return { type: "pane_info", pane: { pane_id: "pane", workspace_id: "w", tab_id: "t", agent: null, agent_session: null } }; if (++starts === 1) throw new Error("agent target pane pane is not an available shell"); assert.deepEqual(params, { name: "a", kind: "codex", pane_id: "pane", args: ["--sandbox", "read-only"], timeout_ms: 45_000 }); return { type: "agent_started", agent: { terminal_id: "term", pane_id: "pane" } }; } } }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)({ id: "m", target: "host", cwd: "/repo" }, "run", "/tmp/pi-subagents-herdr-owned", connection, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "pane" }; const result = await owner.start("codex", "a", ["--sandbox", "read-only"], { timeoutMs: 20, pollMs: 10, clock: { now: () => now, async wait(ms) { now += ms; } } }); assert.deepEqual(methods, ["agent.start", "pane.get", "agent.start"]); assert.equal(starts, 2); assert.deepEqual(result, { terminalId: "term", paneId: "pane", argv: ["codex", "--sandbox", "read-only"] }); });
 	it("does not retry a non-transient start error", async () => { let calls = 0; const connection = { client: { async call() { calls++; throw new Error("permission denied"); } } }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)({ id: "m", target: "host", cwd: "/repo" }, "run", "/tmp/pi-subagents-herdr-owned", connection, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "pane" }; await assert.rejects(owner.start("codex", "a", []), /permission denied/u); assert.equal(calls, 1); });
@@ -140,14 +176,78 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		try { const defaults = resolveRemoteHerdrResources(remote, { agent: "defaults", toolCeiling: ["read"] }, ["read", "bash"]); assert.deepEqual(defaults.tools, ["read"]); assert.ok(defaults.systemPrompt.includes(`[Read from: ${path.join(remote, "remote-only.md")}]`)); assert.doesNotMatch(resolveRemoteHerdrResources(remote, { agent: "defaults", reads: false }, ["read"]).systemPrompt, /remote-only\.md/u); assert.deepEqual(resolveRemoteHerdrResources(remote, { agent: "wide", toolCeiling: ["read"] }, ["read", "bash"]).tools, ["read"]); } finally { fs.rmSync(remote, { recursive: true, force: true }); }
 	});
 
+	it("rejects Pi tool modifier entries in the remote agent's tools instead of filtering or activating them", () => {
+		const remote = fs.mkdtempSync(path.join(os.tmpdir(), "pi-herdr-modifiers-")); fs.mkdirSync(path.join(remote, ".git")); fs.mkdirSync(path.join(remote, ".pi", "agents"), { recursive: true });
+		fs.writeFileSync(path.join(remote, ".pi", "agents", "modifier.md"), "---\nname: modifier\ndescription: modifier\ntools: read, +codemode\n---\nModifier\n");
+		const rejected = { message: /^Agent 'modifier' lists Pi tool modifier entry in `tools`: \+codemode\. .*use `excludeTools` to drop one\.$/u };
+		try { assert.throws(() => resolveRemoteHerdrResources(remote, { agent: "modifier", toolCeiling: ["read"] }, ["read", "bash"]), rejected); assert.throws(() => resolveRemoteHerdrResources(remote, { agent: "modifier" }, ["read", "bash"]), rejected); } finally { fs.rmSync(remote, { recursive: true, force: true }); }
+	});
+
 	it("preserves canonical contact_supervisor progress and structured-interview semantics", { skip: process.platform === "win32" }, async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-herdr-supervisor-")); const old = { mode: process.env[HERDR_PI_MODE_ENV], run: process.env[HERDR_PI_RUN_ENV], dir: process.env[HERDR_PI_RUNTIME_DIR_ENV] }; process.env[HERDR_PI_MODE_ENV] = "1"; process.env[HERDR_PI_RUN_ENV] = "run_supervisor1"; process.env[HERDR_PI_RUNTIME_DIR_ENV] = dir; const handlers = new Map<string, Function>(); let tool: any; let command: any; let socket: net.Socket | undefined;
-		let activeTools = ["read"]; const pi = { registerTool(value: unknown) { tool = value; }, registerCommand(_name: string, value: unknown) { command = value; }, on(name: string, handler: Function) { handlers.set(name, handler); }, getActiveTools: () => activeTools, setActiveTools(value: string[]) { activeTools = value; } };
-		try { registerHerdrPiBridge(pi as never); const ctx = { sessionManager: { getSessionId: () => "native", getSessionFile: () => "/remote/session" }, model: { provider: "p", id: "m" }, isIdle: () => true, hasPendingMessages: () => false }; handlers.get("session_start")?.({}, ctx); socket = net.createConnection(path.join(dir, "bridge.sock")); const decoder = new HerdrPiFrameDecoder(); const frames: any[] = []; socket.on("data", (chunk) => frames.push(...decoder.push(chunk))); await new Promise<void>((resolve) => socket!.once("connect", resolve)); socket.write(encodeHerdrPiFrame({ protocol: 1, runId: "run_supervisor1", type: "configure", requestId: "cfg", resources: { agent: "worker", toolCeiling: ["read"] } })); await new Promise((resolve) => setTimeout(resolve, 30)); assert.ok(frames.some((frame) => frame.type === "configured"));
+		// The active tool set lives on the Pi API; the event context does not carry it.
+		let activeTools = ["read", "bash"]; const pi = { registerTool(value: unknown) { tool = value; }, registerCommand(_name: string, value: unknown) { command = value; }, on(name: string, handler: Function) { handlers.set(name, handler); }, getActiveTools: () => [...activeTools], setActiveTools(value: string[]) { activeTools = [...value]; } };
+		try { registerHerdrPiBridge(pi as never); const ctx = { sessionManager: { getSessionId: () => "native", getSessionFile: () => "/remote/session" }, model: { provider: "p", id: "m" }, isIdle: () => true, hasPendingMessages: () => false }; handlers.get("session_start")?.({}, ctx); socket = net.createConnection(path.join(dir, "bridge.sock")); const decoder = new HerdrPiFrameDecoder(); const frames: any[] = []; socket.on("data", (chunk) => frames.push(...decoder.push(chunk))); await new Promise<void>((resolve) => socket!.once("connect", resolve)); socket.write(encodeHerdrPiFrame({ protocol: 1, runId: "run_supervisor1", type: "configure", requestId: "cfg", resources: { agent: "worker", toolCeiling: ["read"] } })); await new Promise((resolve) => setTimeout(resolve, 30)); assert.deepEqual(frames.find((frame) => frame.type === "ready")?.tools, ["read", "bash"]); assert.deepEqual(frames.find((frame) => frame.type === "configured")?.tools, ["read"]);
 			const progressPromise = tool.execute("tc1", { reason: "progress_update", message: "halfway" }); await new Promise((resolve) => setTimeout(resolve, 10)); const progressRequest = frames.find((frame) => frame.type === "supervisor-request" && frame.reason === "progress_update"); assert.equal(progressRequest?.expectsReply, false); socket.write(encodeHerdrPiFrame({ protocol: 1, runId: "run_supervisor1", type: "supervisor-delivered", requestId: progressRequest.requestId })); const progress = await progressPromise; assert.equal(progress.details.delivered, true);
 			const interviewPromise = tool.execute("tc2", { reason: "interview_request", interview: { title: "Choose", questions: [{ id: "x" }] } }); await new Promise((resolve) => setTimeout(resolve, 10)); const request = frames.find((frame) => frame.type === "supervisor-request" && frame.reason === "interview_request"); assert.deepEqual(request.interview, { title: "Choose", questions: [{ id: "x" }] }); socket.write(encodeHerdrPiFrame({ protocol: 1, runId: "run_supervisor1", type: "prepare", requestId: "reply_1", operation: "supervisor-reply", supervisorId: request.requestId, text: '{"x":"yes"}' })); await new Promise((resolve) => setTimeout(resolve, 10)); await command.handler("reply_1", ctx); const interview = await interviewPromise; assert.deepEqual(interview.details.structuredReply, { x: "yes" }); socket.destroy(); handlers.get("session_shutdown")?.(); }
 		finally { socket?.destroy(); handlers.get("session_shutdown")?.(); old.mode === undefined ? delete process.env[HERDR_PI_MODE_ENV] : process.env[HERDR_PI_MODE_ENV] = old.mode; old.run === undefined ? delete process.env[HERDR_PI_RUN_ENV] : process.env[HERDR_PI_RUN_ENV] = old.run; old.dir === undefined ? delete process.env[HERDR_PI_RUNTIME_DIR_ENV] : process.env[HERDR_PI_RUNTIME_DIR_ENV] = old.dir; fs.rmSync(dir, { recursive: true, force: true }); }
 	});
+
+	for (const reason of ["need_decision", "interview_request", "successful_reply"] as const) {
+		it(`preserves ${reason} through the shared Herdr/Rex supervisor file relay and bridge`, { timeout: 10_000 }, async () => {
+			// Short prefix: the bridge socket lives under this dir, and macOS caps Unix socket paths at 104 bytes.
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psr-"));
+			const bridgeDir = path.join(dir, "bridge"), supervisorDir = path.join(dir, "supervisor");
+			fs.mkdirSync(bridgeDir);
+			fs.mkdirSync(path.join(supervisorDir, "requests"), { recursive: true });
+			fs.mkdirSync(path.join(supervisorDir, "replies"));
+			const saved = { mode: process.env[HERDR_PI_MODE_ENV], run: process.env[HERDR_PI_RUN_ENV], dir: process.env[HERDR_PI_RUNTIME_DIR_ENV] };
+			const runId = "run_relay123";
+			process.env[HERDR_PI_MODE_ENV] = "1";
+			process.env[HERDR_PI_RUN_ENV] = runId;
+			process.env[HERDR_PI_RUNTIME_DIR_ENV] = bridgeDir;
+			const handlers = new Map<string, Function>();
+			let tool: any, command: any, session: HerdrPiSession | undefined, bridge: BridgeChannel | undefined;
+			const pi = { registerTool(value: unknown) { tool = value; }, registerCommand(_name: string, value: unknown) { command = value; }, on(name: string, handler: Function) { handlers.set(name, handler); }, getActiveTools: () => ["read"], setActiveTools() {} };
+			try {
+				registerHerdrPiBridge(pi as never);
+				const ctx = { sessionManager: { getSessionId: () => "native", getSessionFile: () => "/remote/session" }, model: { provider: "p", id: "m" }, isIdle: () => true, hasPendingMessages: () => false };
+				handlers.get("session_start")?.({}, ctx);
+				bridge = new BridgeChannel(path.join(bridgeDir, "bridge.sock"), runId);
+				await bridge.configure({ agent: "worker", toolCeiling: ["read"] });
+				const identity: HerdrRunIdentity = { runId, machineId: "m1", target: "remote", session: null, workspaceId: "w", tabId: "t", paneId: "p", terminalId: "term", agentName: "pi-relay", nativeSessionId: "native", cwd: process.cwd(), runtimeDir: bridgeDir };
+				const host = { async prompt(_connection: unknown, _identity: unknown, text: string) { await command.handler(text.slice("/pi-subagents-bridge ".length), ctx); } };
+				const owner = { identity, machine, connection: {}, host, async cleanup() {} } as unknown as HerdrPlacedRunOwner;
+				session = new HerdrPiSession(owner, { async close() {} }, bridge, ["read"], "p/m", { ...runtime, runId, supervisorChannelDir: supervisorDir, orchestratorSessionId: "parent" });
+				const requested = new Promise<{ requestId: string }>((resolve) => {
+					bridge!.listeners.add((frame) => { if (frame.type === "supervisor-request") resolve(frame as { requestId: string }); });
+				});
+				// Attach both handlers before sending a response, including the expected tool rejection.
+				const outcome = tool.execute("ask", { reason: reason === "interview_request" ? reason : "need_decision", message: "Choose an approach" })
+					.then((value: any) => ({ value }), (error: Error) => ({ error }));
+				const { requestId } = await requested;
+				assert.ok(fs.existsSync(path.join(supervisorDir, "requests", `${requestId}.json`)), "the remote ask must reach the parent's file mailbox");
+				const error = "Supervisor unavailable: the parent is blocked in an async:false workflow. Report the blocker and partial results, then stop.";
+				fs.writeFileSync(path.join(supervisorDir, "replies", `${requestId}.json`), JSON.stringify({ type: "subagent.supervisor.reply", requestId, createdAt: Date.now(), message: reason === "successful_reply" ? "Proceed with approach A" : "", ...(reason === "successful_reply" ? {} : { error }) }));
+				const result = await outcome;
+				if (reason === "successful_reply") {
+					assert.equal(result.error, undefined);
+					assert.match(result.value.content[0].text, /Reply from supervisor:\*\*\nProceed with approach A/);
+				} else {
+					assert.equal(result.value, undefined, "a transport failure must not become a successful empty reply");
+					assert.equal(result.error?.message, error);
+				}
+			} finally {
+				await session?.dispose();
+				bridge?.close();
+				handlers.get("session_shutdown")?.();
+				if (saved.mode === undefined) delete process.env[HERDR_PI_MODE_ENV]; else process.env[HERDR_PI_MODE_ENV] = saved.mode;
+				if (saved.run === undefined) delete process.env[HERDR_PI_RUN_ENV]; else process.env[HERDR_PI_RUN_ENV] = saved.run;
+				if (saved.dir === undefined) delete process.env[HERDR_PI_RUNTIME_DIR_ENV]; else process.env[HERDR_PI_RUNTIME_DIR_ENV] = saved.dir;
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	}
 
 	it("leaves the remote operator's APPEND_SYSTEM.md out of the child's prompt", { skip: process.platform === "win32" }, async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-herdr-append-")); const old = { mode: process.env[HERDR_PI_MODE_ENV], run: process.env[HERDR_PI_RUN_ENV], dir: process.env[HERDR_PI_RUNTIME_DIR_ENV] }; process.env[HERDR_PI_MODE_ENV] = "1"; process.env[HERDR_PI_RUN_ENV] = "run_append01"; process.env[HERDR_PI_RUNTIME_DIR_ENV] = dir; const handlers = new Map<string, Function>(); let socket: net.Socket | undefined;
@@ -164,24 +264,6 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 			assert.doesNotMatch(result.systemPrompt, /REMOTE_OPERATOR_APPEND/u);
 			assert.match(result.systemPrompt, /<active_agent name="worker"\/>/u);
 		} finally { socket?.destroy(); handlers.get("session_shutdown")?.(); old.mode === undefined ? delete process.env[HERDR_PI_MODE_ENV] : process.env[HERDR_PI_MODE_ENV] = old.mode; old.run === undefined ? delete process.env[HERDR_PI_RUN_ENV] : process.env[HERDR_PI_RUN_ENV] = old.run; old.dir === undefined ? delete process.env[HERDR_PI_RUNTIME_DIR_ENV] : process.env[HERDR_PI_RUNTIME_DIR_ENV] = old.dir; fs.rmSync(dir, { recursive: true, force: true }); }
-	});
-
-	it("reports and acknowledges the active tool set from the Pi API, which the event context does not carry", { skip: process.platform === "win32" }, async () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-herdr-tools-")); const old = { mode: process.env[HERDR_PI_MODE_ENV], run: process.env[HERDR_PI_RUN_ENV], dir: process.env[HERDR_PI_RUNTIME_DIR_ENV] }; process.env[HERDR_PI_MODE_ENV] = "1"; process.env[HERDR_PI_RUN_ENV] = "run_tools001"; process.env[HERDR_PI_RUNTIME_DIR_ENV] = dir; const handlers = new Map<string, Function>(); let socket: net.Socket | undefined;
-		let active = ["read", "bash"]; const pi = { registerTool() {}, registerCommand() {}, on(name: string, handler: Function) { handlers.set(name, handler); }, getActiveTools: () => [...active], setActiveTools(names: string[]) { active = [...names]; } };
-		try {
-			// SAFETY: the bridge calls only registerTool, registerCommand, on, getActiveTools and setActiveTools, which this fake provides.
-			registerHerdrPiBridge(pi as never); handlers.get("session_start")?.({}, { sessionManager: { getSessionId: () => "native", getSessionFile: () => "/remote/session" }, model: { provider: "p", id: "m" }, isIdle: () => true, hasPendingMessages: () => false });
-			socket = net.createConnection(path.join(dir, "bridge.sock")); const decoder = new HerdrPiFrameDecoder(); const frames: any[] = []; socket.on("data", (chunk) => frames.push(...decoder.push(chunk))); await new Promise<void>((resolve) => socket!.once("connect", resolve));
-			await new Promise((resolve) => setTimeout(resolve, 30));
-			assert.deepEqual(frames.find((frame) => frame.type === "ready")?.tools, ["read", "bash"]);
-			socket.write(encodeHerdrPiFrame({ protocol: 1, runId: "run_tools001", type: "configure", requestId: "cfg", resources: { agent: "worker", toolCeiling: ["read"] } })); await new Promise((resolve) => setTimeout(resolve, 30));
-			assert.deepEqual(frames.find((frame) => frame.type === "configured")?.tools, ["read"]);
-		} finally {
-			socket?.destroy(); handlers.get("session_shutdown")?.();
-			for (const [name, value] of [[HERDR_PI_MODE_ENV, old.mode], [HERDR_PI_RUN_ENV, old.run], [HERDR_PI_RUNTIME_DIR_ENV, old.dir]] as const) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
-			fs.rmSync(dir, { recursive: true, force: true });
-		}
 	});
 
 	it("frames correlated bridge data and fails closed on malformed, partial, or oversized evidence", () => {
@@ -212,7 +294,7 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		let secondSocket: net.Socket | undefined; const server2 = net.createServer((socket) => { secondSocket = socket; socket.write(Buffer.concat([frame({ type: "accepted", requestId, cursor: 2 }), frame({ type: "settled", requestId, cursor: 3, idle: true, pending: false }), frame({ type: "ready", configured: true, packageVersion, evidenceCursor: 3, evidenceFloor: 1, cursor: 4 }), event(5)])); }); await new Promise<void>((resolve) => server2.listen(two, resolve));
 		const fakeConnection = () => ({ endpoint: { socket: "/tmp/h", session: null, version: "0.9.0", protocol: 1, compatible: true as const, running: true as const }, socketPath: "/tmp/h", client: { async call() { dispatches++; firstSocket?.write(encodeHerdrPiFrame({ protocol: 1, runId: "run_12345678", type: "accepted", requestId, nativeSessionId: "native1", cursor: 2 })); setTimeout(() => firstSocket?.destroy(), 5); return {}; }, async subscribe() { return () => {}; } }, async forwardRemoteSocket() { throw new Error("unused"); }, async close() {} });
 		const identity: HerdrRunIdentity = { runId: "run_12345678", machineId: "m1", target: "remote", session: null, workspaceId: "w1", tabId: "t1", paneId: "p1", terminalId: "term1", agentName: "agent", nativeSessionId: "native1", cwd: "/remote", runtimeDir: "/tmp/run" };
-		const bridge = new BridgeChannel(one, identity.runId); const connection = fakeConnection(); const owner = { identity, connection, snapshot: { connection: "connected", state: "ready", identity, revision: 0 }, async replaceConnection(input: { connection: ReturnType<typeof fakeConnection>; paneId: string; state: "ready" | "working" | "blocked" | "settled" | "unknown" }) { this.connection = input.connection; this.identity = { ...this.identity, paneId: input.paneId }; this.snapshot = { connection: "connected", state: input.state, identity: this.identity, revision: this.snapshot.revision + 1 }; }, async cleanup() { await this.connection.close(); }, statusSubscriptions: () => [], observeEvent() {}, markConnectionUnknown: () => true } as unknown as HerdrPlacedRunOwner; const session = new HerdrPiSession(owner, { async close() {} }, bridge, ["read"], "p/m", runtime);
+		const bridge = new BridgeChannel(one, identity.runId); const connection = fakeConnection(); const owner = { identity, connection, host: herdrPaneHost, snapshot: { connection: "connected", state: "ready", identity, revision: 0 }, async replaceConnection(input: { connection: ReturnType<typeof fakeConnection>; paneId: string; state: "ready" | "working" | "blocked" | "settled" | "unknown" }) { this.connection = input.connection; this.identity = { ...this.identity, paneId: input.paneId }; this.snapshot = { connection: "connected", state: input.state, identity: this.identity, revision: this.snapshot.revision + 1 }; }, async cleanup() { await this.connection.close(); }, statusSubscriptions: () => [], observeEvent() {}, markConnectionUnknown: () => true } as unknown as HerdrPlacedRunOwner; const session = new HerdrPiSession(owner, { async close() {} }, bridge, ["read"], "p/m", runtime);
 		const reconnectConnection = { endpoint: { session: null, protocol: 22, version: "0.9.0" }, client: { async call(method: string) { if (method === "session.snapshot") return { type: "session_snapshot", snapshot: { agents: [{ terminal_id: "term1", pane_id: "p1", agent_status: "idle" }] } }; dispatches++; return {}; }, async subscribe() { return () => {}; } }, async forwardRemoteSocket() { return { socketPath: two, async close() {} }; }, async close() {} };
 		let next: BridgeChannel | undefined; session.armReconnect(() => reconnectHerdrPiSession(session, { ...launch(true), machine: { ...machine, cwd: "/remote" } }, { connect: (async () => reconnectConnection) as never, discoverManifest: (async () => ({ socketPath: "/remote/bridge" })) as never, createBridge: (socketPath, runId) => next = new BridgeChannel(socketPath, runId) }));
 		let settles = 0; const seen: string[] = []; let liveSeen!: () => void; const live = new Promise<void>((resolve) => { liveSeen = resolve; }); session.subscribe((value) => { if (value.type === "agent_settled") settles++; if (value.type === "tool_execution_start") { seen.push((value as { args: { path: string } }).args.path); if (seen.includes("file-6")) liveSeen(); } });

@@ -109,6 +109,7 @@ import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../s
 import { childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { clearProviderRetry, observeProviderDiagnostics, snapshotProviderDiagnostics } from "../../shared/provider-diagnostics.ts";
+import { isRexLocalMachine } from "../shared/rex-machine.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
@@ -553,8 +554,8 @@ async function runSingleAttempt(
 		return result;
 	}
 	// A machine 'local' child edits this disk, so its local Git evidence is authoritative, as for an unplaced run.
-	const mutationCwd = options.machine?.provider === "rex" ? options.machine.cwd : options.cwd ?? runtimeCwd;
-	const mutationSnapshot = options.machine?.provider === "herdr" ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: mutationCwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : snapshotTrackedMutations(mutationCwd);
+	const mutationCwd = isRexLocalMachine(options.machine) ? options.machine.cwd : options.cwd ?? runtimeCwd;
+	const mutationSnapshot = options.machine && !isRexLocalMachine(options.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: mutationCwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : snapshotTrackedMutations(mutationCwd);
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 	let toolAvailabilityError: string | undefined;
@@ -668,6 +669,8 @@ async function runSingleAttempt(
 		let agentSettledReceived = false;
 		let queuedDrainHold = false;
 		let compactionStartedReceived = false;
+		let terminalAgentEndReceived = false;
+		let compactionAfterFinalOpen = false;
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardFinishTimer: NodeJS.Timeout | undefined;
 		let watchdogTailTimer: NodeJS.Timeout | undefined;
@@ -710,7 +713,8 @@ async function runSingleAttempt(
 			if (sessionSettled || finalDrainTimer || lifecycleFinished) return;
 			finalDrainTimer = setTimeout(() => {
 				if (lifecycleFinished || sessionSettled) return;
-				if (capture.finalDrainHeld() || observeQueuedDrainHold()) {
+				// Pi runs auto-compaction after the final agent_end and only then emits agent_settled.
+				if (capture.finalDrainHeld() || observeQueuedDrainHold() || compactionAfterFinalOpen) {
 					finalDrainTimer = undefined;
 					armFinalDrainTimer();
 					return;
@@ -724,9 +728,7 @@ async function runSingleAttempt(
 					if (lifecycleFinished || sessionSettled) return;
 					settle(undefined, true);
 				}, HARD_FINISH_MS);
-				finalHardFinishTimer.unref?.();
 			}, FINAL_STOP_GRACE_MS);
-			finalDrainTimer.unref?.();
 		};
 		function armWatchdogTail(): void {
 			if ((!cleanTerminalAssistantStopReceived && !agentSettledReceived) || watchdogTailTimer || lifecycleFinished || sessionSettled) return;
@@ -744,12 +746,20 @@ async function runSingleAttempt(
 			}, childWatchdog?.watchdogTailTimeoutMs ?? 120_000);
 			watchdogTailTimer.unref?.();
 		}
-		const applyChildLifecycle = (action: ChildLifecycleAction): void => {
+		const applyChildLifecycle = (action: ChildLifecycleAction, event?: { type?: string; willRetry?: unknown }): void => {
 			if (action === "cancel-drain") {
-				cleanTerminalAssistantStopReceived = false;
+				// After a clean final stop, a non-retrying agent_end may be the child's last event
+				// (Pi may not emit agent_settled), so it re-arms the drain instead of cancelling it.
+				terminalAgentEndReceived = event?.type === "agent_end" && event.willRetry !== true && cleanTerminalAssistantStopReceived;
 				agentSettledReceived = false;
 				clearFinalDrainTimers();
 				clearWatchdogTailTimer();
+				if (terminalAgentEndReceived) {
+					startFinalDrain();
+					return;
+				}
+				cleanTerminalAssistantStopReceived = false;
+				compactionAfterFinalOpen = false;
 				return;
 			}
 			if (action === "start-drain") startFinalDrain();
@@ -1008,10 +1018,16 @@ async function runSingleAttempt(
 			if (evt.type === "compaction_start") {
 				compactionStartedReceived = true;
 				if (agentSettledReceived) afterCompactionSettlement = true;
+				if (terminalAgentEndReceived) compactionAfterFinalOpen = true;
 			}
 			if (evt.type === "compaction_end" && evt.willRetry === true) {
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
+			}
+			if (evt.type === "compaction_end" && evt.willRetry !== true && compactionAfterFinalOpen) {
+				compactionAfterFinalOpen = false;
+				clearFinalDrainTimers();
+				startFinalDrain();
 			}
 			if (evt.type === "turn_start" || evt.type === "agent_start" || evt.type === "auto_retry_start") {
 				queuedDrainHold = false;
@@ -1039,7 +1055,7 @@ async function runSingleAttempt(
 				agentSettledReceived = true;
 				afterCompactionSettlement = compactionStartedReceived;
 			}
-			applyChildLifecycle(lifecycleAction);
+			applyChildLifecycle(lifecycleAction, evt);
 
 			if (isChildWatchdogStatusEvent(evt)) {
 				if (!childWatchdog) return;
@@ -1590,7 +1606,7 @@ async function runSingleAttempt(
 		durationMs: progress.durationMs,
 	};
 	const remoteGitChanged = result.nativeMachine?.initialGit && result.nativeMachine.finalGit ? result.nativeMachine.initialGit.head !== result.nativeMachine.finalGit.head || result.nativeMachine.initialGit.dirty !== result.nativeMachine.finalGit.dirty : undefined;
-	const mutationEvidence = result.nativeMachine && result.nativeMachine.provider !== "rex" ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : collectTrackedMutationEvidence(mutationSnapshot, mutationCwd);
+	const mutationEvidence = result.nativeMachine && !isRexLocalMachine(options.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : collectTrackedMutationEvidence(mutationSnapshot, mutationCwd);
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	const structuredText = result.structuredOutput === undefined ? undefined : JSON.stringify(result.structuredOutput, null, 2);

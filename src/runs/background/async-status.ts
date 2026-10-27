@@ -168,6 +168,10 @@ interface AsyncRunListOptions {
 	includeNested?: boolean;
 	/** Explicit repair/debug escape hatch. Normal runtime paths must not set this. */
 	repairScan?: boolean;
+	/** This process's completion owner, adopted by an owner-exited workflow repair of a run the session owns; needs `sessionId`. */
+	adoptCompletionOwnerId?: string;
+	/** Receives the warning for a skipped corrupt terminal status, so an open TUI can show it as a notice instead of console output. */
+	onCorruptStatus?: (warning: string) => void;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -182,6 +186,10 @@ function isAsyncStatusIsolationError(asyncDir: string, error: unknown): boolean 
 		|| message.startsWith(`Invalid host step '${statusPath}`)
 		|| /^(workflowChildren|Invalid workflowChildren)/.test(message);
 }
+
+// Status path -> last logged signature. A corrupt run is re-scanned on every
+// status poll, so the line repeats only when the file or the outcome changes.
+const reportedCorruptStatus = new Map<string, string>();
 
 function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown, now?: () => number): void {
 	const statusPath = path.join(asyncDir, "status.json");
@@ -205,7 +213,18 @@ function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown
 			markerAction = `failed to release active marker: ${getErrorMessage(releaseError)}`;
 		}
 	}
-	console.error(`[pi-subagents] Skipping corrupt active async run '${runId}' at '${statusPath}': ${getErrorMessage(error)}; ${markerAction}.`);
+	const line = `[pi-subagents] Skipping corrupt active async run '${runId}' at '${statusPath}': ${getErrorMessage(error)}; ${markerAction}.`;
+	let fileSignature = "";
+	try {
+		const stat = fs.statSync(statusPath);
+		fileSignature = `${stat.size}:${stat.mtimeMs}`;
+	} catch {
+		// A missing file still gets the line once; its message carries the cause.
+	}
+	const signature = `${fileSignature}\n${line}`;
+	if (reportedCorruptStatus.get(statusPath) === signature) return;
+	reportedCorruptStatus.set(statusPath, signature);
+	console.error(line);
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -524,7 +543,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			}
 			if (wantsTerminal) {
 				for (const sessionId of owners ?? [undefined]) {
-					for (const entry of readRecentTerminalRunIndex(asyncDirRoot, { sessionId, ...(options.entryLimit !== undefined ? { limit: options.entryLimit } : {}) })) indexed.add(entry);
+					for (const entry of readRecentTerminalRunIndex(asyncDirRoot, { sessionId, onCorruptStatus: options.onCorruptStatus, ...(options.entryLimit !== undefined ? { limit: options.entryLimit } : {}) })) indexed.add(entry);
 				}
 			}
 			entries = [...indexed];
@@ -556,16 +575,19 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		let status: (AsyncStatus & { cwd?: string }) | null;
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
+			let owned = false;
 			if (owners) {
 				const stored = readStatus(asyncDir);
 				if (stored && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);
 					continue;
 				}
+				owned = stored !== null;
 			}
+			// Only a run this session owns may adopt the caller's completion owner.
 			const reconciliation = options.reconcile === false
 				? undefined
-				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now }, observeStatus);
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined }, observeStatus);
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
