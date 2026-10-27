@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { runSetupCommand, type SetupCommandOptions, type SetupCommandResult } from "./worktree-setup-command.ts";
 import * as fs from "node:fs";
@@ -78,6 +79,8 @@ export interface WorktreeDiff {
 	insertions: number;
 	deletions: number;
 	patchPath: string;
+	/** Repository-relative paths, including both sides of a rename. Unavailable on capture failure or non-UTF-8 filenames. */
+	paths?: string[];
 	error?: string;
 }
 
@@ -277,23 +280,30 @@ class SetupTransaction {
 	}
 }
 
-function runGit(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
-	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", windowsHide: true, shell: false, ...(env ? { env: { ...process.env, ...env } } : {}) });
+function runGitBytes(cwd: string, args: string[], env?: NodeJS.ProcessEnv) {
+	const result = spawnSync("git", ["-C", cwd, ...args], { windowsHide: true, shell: false, ...(env ? { env: { ...process.env, ...env } } : {}) });
 	return {
-		stdout: result.stdout ?? "",
-		stderr: result.stderr ?? "",
+		stdout: result.stdout ?? Buffer.alloc(0),
+		stderr: result.stderr ?? Buffer.alloc(0),
 		status: result.status,
 	};
 }
 
-function runGitChecked(cwd: string, args: string[]): string {
-	const result = runGit(cwd, args);
+function runGit(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
+	const result = runGitBytes(cwd, args, env);
+	return { stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8"), status: result.status };
+}
+
+function runGitChecked(cwd: string, args: string[]): string;
+function runGitChecked(cwd: string, args: string[], raw: true): Buffer;
+function runGitChecked(cwd: string, args: string[], raw = false): string | Buffer {
+	const result = runGitBytes(cwd, args);
 	if (result.status !== 0) {
 		const command = `git -C ${cwd} ${args.join(" ")}`;
-		const message = result.stderr.trim() || result.stdout.trim() || `${command} failed`;
+		const message = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim() || `${command} failed`;
 		throw new Error(message);
 	}
-	return result.stdout;
+	return raw ? result.stdout : result.stdout.toString("utf8");
 }
 
 /** Validate a captured patch against the worktree index without changing either. */
@@ -1096,28 +1106,43 @@ function emptyDiff(index: number, agent: string, branch: string, patchPath: stri
 		insertions: 0,
 		deletions: 0,
 		patchPath,
+		...(!error ? { paths: [] } : {}),
 		...(error ? { error } : {}),
 	};
 }
 
-function parseNumstat(numstat: string): { filesChanged: number; insertions: number; deletions: number } {
-	const lines = numstat
-		.split("\n")
-		.map((line) => line.trim())
-		.filter(Boolean);
+function parseNumstat(numstat: Buffer): { filesChanged: number; insertions: number; deletions: number; paths?: string[] } {
+	// With -z Git emits paths verbatim. A rename has an empty path followed by
+	// separate old/new path records; tabs and newlines inside names stay intact.
+	// Git permits byte filenames that JSON strings cannot represent losslessly.
+	// Keep usable patches/statistics, but never publish replacement characters as identities.
+	const losslessPaths = isUtf8(numstat);
+	const records = numstat.toString("utf8").split("\0");
+	const paths = new Set<string>();
 	let filesChanged = 0;
 	let insertions = 0;
 	let deletions = 0;
 
-	for (const line of lines) {
-		const [rawInsertions, rawDeletions] = line.split("\t");
-		if (rawInsertions === undefined || rawDeletions === undefined) continue;
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index]!;
+		if (!record) continue;
+		const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(record);
+		if (!match) throw new Error("Invalid NUL-delimited worktree diff statistics.");
+		const [, rawInsertions, rawDeletions, file] = match;
+		if (file) paths.add(file);
+		else {
+			const oldPath = records[++index];
+			const newPath = records[++index];
+			if (!oldPath || !newPath) throw new Error("Incomplete worktree rename statistics.");
+			paths.add(oldPath);
+			paths.add(newPath);
+		}
 		filesChanged++;
-		if (/^\d+$/.test(rawInsertions)) insertions += parseInt(rawInsertions, 10);
-		if (/^\d+$/.test(rawDeletions)) deletions += parseInt(rawDeletions, 10);
+		if (rawInsertions !== "-") insertions += Number(rawInsertions);
+		if (rawDeletions !== "-") deletions += Number(rawDeletions);
 	}
 
-	return { filesChanged, insertions, deletions };
+	return { filesChanged, insertions, deletions, ...(losslessPaths ? { paths: [...paths].sort() } : {}) };
 }
 
 function captureWorktreeDiff(
@@ -1130,7 +1155,7 @@ function captureWorktreeDiff(
 	runGitChecked(worktree.path, ["add", "-A"]);
 	const diffStat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--stat", setup.baseCommit]).trim();
 	const patch = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_PATCH_OPTIONS, setup.baseCommit]);
-	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", setup.baseCommit]);
+	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", "-z", setup.baseCommit], true);
 	fs.writeFileSync(patchPath, patch, "utf-8");
 
 	if (!patch.trim()) {
@@ -1149,6 +1174,7 @@ function captureWorktreeDiff(
 		filesChanged: parsed.filesChanged,
 		insertions: parsed.insertions,
 		deletions: parsed.deletions,
+		...(parsed.paths ? { paths: parsed.paths } : {}),
 		patchPath,
 	};
 }

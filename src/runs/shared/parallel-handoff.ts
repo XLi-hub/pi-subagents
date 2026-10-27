@@ -596,6 +596,7 @@ function writeParallelHandoffGroupUnlocked(input: {
 					filesChanged: diff.filesChanged,
 					insertions: diff.insertions,
 					deletions: diff.deletions,
+					...(diff.paths ? { paths: diff.paths } : {}),
 					...(diff.error ? { error: diff.error } : {}),
 				},
 			};
