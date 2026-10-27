@@ -79,10 +79,10 @@ function validateManifestIdentity(parsed: ParallelHandoffManifest, manifestPath:
 	const childIndexes = new Set<number>();
 	for (const [groupIndex, group] of parsed.groups.entries()) {
 		if (!group || typeof group !== "object" || !Array.isArray(group.children) || !group.cleanup || !Array.isArray(group.cleanup.tasks)) throw new Error(`Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}] is malformed.`);
+		const cleanupIndexes = new Set(group.cleanup.tasks.map((task) => task.index));
 		if (group.laneBindings !== undefined) {
 			if (!Array.isArray(group.laneBindings)) throw new Error(`Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].laneBindings must be an array.`);
 			const taskIndexes = new Set<number>();
-			const cleanupIndexes = new Set(group.cleanup.tasks.map((task) => task.index));
 			group.laneBindings = group.laneBindings.map((binding, bindingIndex) => {
 				const normalized = normalizeLaneBinding(binding, `Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].laneBindings[${bindingIndex}]`);
 				if (taskIndexes.has(normalized.taskIndex)) throw new Error(`Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}] has duplicate lane binding taskIndex ${normalized.taskIndex}.`);
@@ -101,7 +101,7 @@ function validateManifestIdentity(parsed: ParallelHandoffManifest, manifestPath:
 			taskIndexes.add(taskIndex);
 			if (childIndexes.has(index)) throw new Error(`Invalid parallel handoff manifest '${manifestPath}': duplicate child index ${index}.`);
 			childIndexes.add(index);
-			if (!group.cleanup.tasks.some((task) => task.index === taskIndex)) throw new Error(`Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].children[${childIndex}] has no cleanup task for taskIndex ${taskIndex}.`);
+			if (!cleanupIndexes.has(taskIndex)) throw new Error(`Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].children[${childIndex}] has no cleanup task for taskIndex ${taskIndex}.`);
 			const workflowKey = optionalIdentity(childRecord.workflowKey, `Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].children[${childIndex}].workflowKey`);
 			const runId = optionalIdentity(childRecord.runId, `Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].children[${childIndex}].runId`);
 			const lane = normalizeWorkflowLaneMetadata(childRecord.lane, `Invalid parallel handoff manifest '${manifestPath}': groups[${groupIndex}].children[${childIndex}].lane`);
@@ -120,9 +120,31 @@ function validateManifestIdentity(parsed: ParallelHandoffManifest, manifestPath:
 	return parsed;
 }
 
-export function readParallelHandoffManifest(manifestPath: string): ParallelHandoffManifest | undefined {
+function readBoundedHandoff(manifestPath: string, maxBytes: number): string {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error("Invalid parallel handoff read limit.");
+	const fd = fs.openSync(manifestPath, "r");
+	try {
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.size > maxBytes) throw new Error("Parallel handoff is not a regular file within the read limit.");
+		// One extra byte detects growth without allowing an unbounded read after
+		// the size check. The same descriptor also pins atomic-file replacements.
+		const buffer = Buffer.alloc(stat.size + 1);
+		let offset = 0;
+		while (offset < buffer.length) {
+			const read = fs.readSync(fd, buffer, offset, buffer.length - offset, null);
+			if (read === 0) break;
+			offset += read;
+		}
+		if (offset !== stat.size) throw new Error("Parallel handoff changed while being read.");
+		return buffer.subarray(0, offset).toString("utf8");
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+export function readParallelHandoffManifest(manifestPath: string, maxBytes?: number): ParallelHandoffManifest | undefined {
 	if (!fs.existsSync(manifestPath)) return undefined;
-	const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ParallelHandoffManifest;
+	const parsed = JSON.parse(maxBytes === undefined ? fs.readFileSync(manifestPath, "utf-8") : readBoundedHandoff(manifestPath, maxBytes)) as ParallelHandoffManifest;
 	return validateManifestIdentity(parsed, manifestPath);
 }
 

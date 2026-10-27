@@ -146,6 +146,14 @@ A forked child's requests start exactly as its parent's last request did, so the
 
 In workflow runs that omit `context`, each `runs.run` child follows the global `defaultSubagentContext` when set, then its own `defaultContext`. Without the global setting, a fresh-default worker can run fresh beside a fork-default oracle. If the parent session file or current leaf is not available yet, implicit fork-default children run fresh. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
 
+### Workflow worktree inspection
+
+`await runs.worktreeChanges(keys)` reads the bounded captured-change report for up to 64 unique child keys already launched in the current workflow. It returns `{ version, state, children, overlaps, reviewGroups, disjointChildren }`; use each child's `patchPath`/`handoffPath` to give a reviewer concrete evidence. `state: "incomplete"` preserves missing or unfinished evidence. A single key is supported, and an empty selection returns an empty complete report.
+
+One workflow may inspect 256 selected keys cumulatively; rejected selections and empty queries do not consume that allowance. Each explicit snapshot uses the bounded handoff-read and report-size limits documented in [workflows](workflows.md#inspect-worktree-changes-inside-a-workflow). No completion or status analysis runs automatically; retain a chosen projection with return or emit. Await writers through their run promises rather than polling this synchronous metadata query.
+
+Inputs are keys rather than caller-provided paths, result objects, or raw run ids. The complete selection is validated before reading any handoff, and the host uses its stored child results. The call is read-only and starts no work. It does not wait for pending children or count as awaiting their launch promises. Complete inventory is separate from child success: failed work can still have a captured patch, so check the child's `ok` as well. See the [grouped-review example](workflows.md#inspect-worktree-changes-inside-a-workflow).
+
 ### Workflow steering
 
 `runs.steer(key, message, options?)` targets a stable key already launched by `runs.run` or `runs.all`. It does not accept a raw run id. Options are `mode?: "steer" | "follow_up" | "auto"`, `index?: number`, and `ackTimeoutMs?: number`. The promise returns `{ key, state, requestId?, deliveryStatus?, targets?, error? }`, where `state` is `queued`, `delivered`, `missed`, or `failed`.

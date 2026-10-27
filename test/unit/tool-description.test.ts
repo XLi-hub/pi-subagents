@@ -86,6 +86,7 @@ describe("registered subagent tool description", () => {
 		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "compact" }), COMPACT_SUBAGENT_TOOL_DESCRIPTION);
 		assert.ok(COMPACT_SUBAGENT_TOOL_DESCRIPTION.length < FULL_SUBAGENT_TOOL_DESCRIPTION.length);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /runs.lanes.*structuredOutput.verdict === 'blocked'.*never reviewer prose/);
+		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /runs.worktreeChanges\(keys\).*up to 64 prior child keys.*incomplete evidence.*launches nothing/);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /mission:false.*state.get.*state.set/);
 		for (const detail of [
 			/explicit return, top-level await.*nested async function\/arrow\/method helpers are rejected/,

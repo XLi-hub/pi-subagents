@@ -4833,6 +4833,7 @@ function workflowChildResult(
 		...(resolvedContext ? { resolvedContext } : {}),
 		...(outputReference ? { outputReference } : {}),
 		...(outputArtifactPath ? { outputArtifactPath } : {}),
+		...(result.details.parallelHandoff ? { worktreeHandoff: result.details.parallelHandoff } : {}),
 		...(acceptanceRecovery ? { recovery: acceptanceRecovery } : {}),
 		...(outputPathMapping ? { outputPathMapping } : {}),
 		...(externalAdapter ? { externalAdapter } : {}),
