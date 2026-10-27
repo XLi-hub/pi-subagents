@@ -228,7 +228,10 @@ return board.map((lane) => ({
     ok: stage.ok,
     runId: stage.runId,
     outputReference: stage.outputReference,
-    verdict: stage.verdict
+    verdict: stage.verdict,
+    resumability: stage.resumability,
+    terminalOutcome: stage.terminalOutcome,
+    recovery: stage.recovery
   }))
 }));
 ```
@@ -237,7 +240,21 @@ The first stage from every lane is launched in one existing `runs.all(...)` batc
 
 The helper validates the complete plain-JSON lane inventory before launching anything. It bounds the inventory to 32 lanes, 16 stages per lane, 64 total stages, and 64 KiB of canonical JSON; task and path fields retain the existing 1 MiB and 32 KiB limits. Stage keys must be unique within a lane and generated keys must be unique and valid workflow keys. A child failure, stopped/detached result, or explicit `structuredOutput.verdict === "blocked"` blocks only that lane; later stages are marked `skipped` and sibling lanes continue. Reviewer prose is never parsed.
 
-The board is bounded and contains only lane/stage keys, state, success, retained run ids, explicit output references, bounded errors, and an optional structured verdict. It does not return child transcripts or create a lane registry or cleanup authority. Use raw `runs.run(...)`/`runs.all(...)` when a workflow needs conditional or rolling orchestration beyond this helper.
+The board is bounded and contains lane/stage keys, state, success, retained run ids, explicit output references, bounded errors, an optional structured verdict, and recorded recovery facts. It does not return child transcripts or create a lane registry or cleanup authority. Use raw `runs.run(...)`/`runs.all(...)` when a workflow needs conditional or rolling orchestration beyond this helper.
+
+Settled stage rows preserve these optional fields from the child result:
+
+| Field | What it records |
+| --- | --- |
+| `resumability` | `{ state: "resumable" }` or `{ state: "not-resumable", reason }` as inspected at child settlement. Missing means unknown, not permission to resume. |
+| `terminalOutcome` | `{ state: "partial", reason: "timeout" \| "budget_exhausted" }` when the child recorded that partial outcome. |
+| `recovery` | A captured acceptance report available for review after metadata rejection: status, reason, exact report path, and SHA-256 hash. This does not make the rejected child successful. |
+
+These facts let a script distinguish a blocked lane with a retained session from one with no recorded continuation, and preserve partial-work evidence without polling or reading receipts. A successful stage can be non-resumable, and a failed stage can have a resumable session. They describe the recorded result, not the current existence or quality of a report/session. Any later `runs.run(key, { resume: stage.runId, task: "..." })` remains explicit and performs the normal authoritative eligibility checks. Use a new workflow key for that follow-up; this helper never retries automatically. Acceptance-metadata recovery still permits only explicit read-only review with `acceptance: false`; exposing its report does not weaken that barrier.
+
+Recovery reasons remain bounded to 256 UTF-8 bytes. Run IDs and report paths over that limit are omitted rather than truncated into a different reference, and a row without an exact run ID never advertises resumability. Running receipts and skipped stages do not expose settled recovery facts. Stopped or supervisor-detached stages do not advertise a resumable session; answer an outstanding supervisor request through its existing route first.
+
+When several stages returned resumable sessions, select the latest relevant stage for the follow-up rather than resuming every row. A retained resume can produce a new run ID; keep that returned ID for subsequent passes. Recovery never overwrites the earlier report by default. A session that disappears after the board was captured is rejected before a new child launches.
 
 ### Typed post-run checks and typed steps
 
