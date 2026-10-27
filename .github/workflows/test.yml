@@ -4,8 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, 'feat/**']
-  workflow_dispatch:
+    branches: [main]
 
 # A new push to a PR branch supersedes its running checks. Other runs get a unique group,
 # because a shared group would queue main runs and drop all but the newest pending one.
