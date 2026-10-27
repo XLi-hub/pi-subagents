@@ -90,7 +90,7 @@ export interface SubagentWaitParams {
 	all?: boolean;
 	/** Give up after this many milliseconds. Defaults to waitTool.defaultTimeoutMs, then 30 minutes. */
 	timeoutMs?: number;
-	/** False keeps a blocking wait open through idle attention; supervisor/contact requests still stop the wait. */
+	/** False keeps a blocking wait open through all attention except supervisor/contact requests, such as idle time, a tool held open, or repeated tool failures. */
 	stopOnAttention?: boolean;
 }
 
@@ -130,7 +130,7 @@ export interface SubagentWaitDeps {
 	subscribe?: (input: { targetKind: "async" | "foreground"; runId: string; requestedId: string; timeoutMs: number }) => { token: string; expiresAt: number };
 	/** Injectable provider protocol surfaces for deterministic tests. */
 	backgroundWork?: {
-		snapshot(sessionId: string, nowMs: number): BackgroundWorkSnapshot;
+		snapshot(sessionIds: readonly string[], nowMs: number): BackgroundWorkSnapshot;
 		wakeChannels(): readonly string[];
 	};
 	/**
@@ -272,10 +272,13 @@ function backgroundWorkIdentity(item: RegisteredBackgroundWorkItem): string {
 	return `${item.provider}\0${item.sessionId}\0${item.id}`;
 }
 
-function backgroundWorkForSession(deps: SubagentWaitDeps, nowMs: number): BackgroundWorkSnapshot {
+export function backgroundWorkForSession(deps: Pick<SubagentWaitDeps, "state" | "backgroundWork">, nowMs: number): BackgroundWorkSnapshot {
 	const sessionId = deps.state.currentSessionId;
 	if (!sessionId) throw new Error("bg_wait requires an active session identity to scope background work safely.");
-	return deps.backgroundWork?.snapshot(sessionId, nowMs) ?? snapshotBackgroundWork(sessionId, nowMs);
+	// Providers may key items by the session file path or by getSessionId(); accept both.
+	const piSessionId = deps.state.supervisorOwnerSessionId;
+	const sessionIds = piSessionId ? [sessionId, piSessionId] : [sessionId];
+	return deps.backgroundWork?.snapshot(sessionIds, nowMs) ?? snapshotBackgroundWork(sessionIds, nowMs);
 }
 
 export function waitRunScopes(deps: Pick<SubagentWaitDeps, "asyncDirRoot" | "resultsDir" | "nestedRootRunId">): Array<{ asyncDirRoot: string; resultsDir: string }> {
@@ -846,8 +849,13 @@ export async function waitForSubagents(
 	const supervisorAttentionHint = relevantAttention.some(hasSupervisorTool)
 		? " Reply to any pending supervisor request. If subagent_supervisor({ action: \"pending\" }) is empty, check intercom({ action: \"pending\" }) because an external intercom tool may own the request."
 		: "";
+	// Only when watchdog attention alone ended the wait: stopOnAttention: false would have kept blocking.
+	const keepWaitingHint = stopOnAttention && supervisorAttentionHint === ""
+		&& (waitForAll || finishedAsyncCount + providerFinishedCount === 0)
+		? " These runs are still running and none is waiting on a supervisor reply. To keep waiting through this kind of attention, call bg_wait again with stopOnAttention: false; supervisor requests still end that wait."
+		: "";
 	const attentionNote = relevantAttention.length > 0
-		? ` ${relevantAttention.length} run(s) need attention: ${relevantAttention.map((run) => run.id).join(", ")} —${supervisorAttentionHint} inspect with subagent({ action: "status" }) then steer a top-level live async child, resume a paused/completed/failed child, or interrupt explicitly.`
+		? ` ${relevantAttention.length} run(s) need attention: ${relevantAttention.map((run) => run.id).join(", ")} —${supervisorAttentionHint} inspect with subagent({ action: "status" }) then steer a top-level live async child, resume a paused/completed/failed child, or interrupt explicitly.${keepWaitingHint}`
 		: "";
 	const stillRunning = active.filter((run) => initialAsyncIds.has(run.id)).length
 		+ providerActive.filter((item) => initialProviderIds.has(backgroundWorkIdentity(item))).length;

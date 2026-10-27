@@ -914,6 +914,47 @@ describe("async status helpers", () => {
 		}
 	});
 
+	it("logs a corrupt active status once per file and outcome across polls", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-corrupt-repeat-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			const corruptDir = path.join(root, "bad-run");
+			const statusPath = path.join(corruptDir, "status.json");
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-run");
+			const corrupt = Buffer.from([0, 0, 0]);
+			fs.mkdirSync(corruptDir, { recursive: true });
+			fs.writeFileSync(statusPath, corrupt);
+			fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+			fs.writeFileSync(markerPath, "", "utf-8");
+			const list = (now?: number) => listAsyncRuns(root, { states: ["running"], reconcile: false, ...(now === undefined ? {} : { now: () => now }) });
+			const lines = () => diagnostics.filter((message) => message.includes("Skipping corrupt active async run"));
+
+			list();
+			list();
+			assert.equal(lines().length, 1);
+			assert.match(lines()[0]!, /active marker retained/);
+
+			fs.writeFileSync(statusPath, JSON.stringify({ runId: "bad-run", mode: "single", state: "running", startedAt: 100, sessionId: "session-a", steps: [{ agent: "worker", status: "running" }] }), "utf-8");
+			list();
+			fs.writeFileSync(statusPath, corrupt);
+			fs.utimesSync(statusPath, new Date(5_000), new Date(5_000));
+			list();
+			assert.equal(lines().length, 2, "the same corrupt bytes written again are logged again");
+			assert.equal(lines()[1], lines()[0]);
+
+			list(Date.now() + DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS + 60_000);
+			assert.equal(fs.existsSync(markerPath), false);
+			assert.equal(lines().length, 3, "a marker release on unchanged bytes is still logged");
+			assert.match(lines()[2]!, /stale active marker released/);
+			assert.deepEqual(fs.readFileSync(statusPath), corrupt);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("isolates active status validation failures while preserving ordinary validation errors", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-invalid-active-"));
 		const originalError = console.error;
@@ -1206,6 +1247,69 @@ describe("async status helpers", () => {
 			const runs = listAsyncRuns(root, { sessionId: "session-a", states: ["complete"], entryLimit: 2, reconcile: false });
 			assert.deepEqual(runs.map((run) => run.id), ["terminal-3", "terminal-2"]);
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates corrupt indexed terminal statuses without changing status or index evidence", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-terminal-corrupt-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			for (const runId of ["terminal-good-a", "terminal-corrupt", "terminal-good-b"]) {
+				createAsyncDir(root, runId, {
+					runId,
+					sessionId: "session-a",
+					mode: "single",
+					state: "complete",
+					startedAt: 100,
+					endedAt: 200,
+					steps: [{ agent: "worker", status: "complete" }],
+				});
+			}
+			const corruptStatus = path.join(root, "terminal-corrupt", "status.json");
+			const corruptBytes = Buffer.alloc(32, 0);
+			fs.writeFileSync(corruptStatus, corruptBytes);
+			const indexDir = path.join(root, TERMINAL_RUN_INDEX_DIR, encodeIndexSegment("session-a"));
+			const marker = path.join(indexDir, "0000000000000200-terminal-corrupt.json");
+			const aliasMarker = path.join(indexDir, "0000000000000300-terminal-corrupt.json");
+			fs.writeFileSync(aliasMarker, fs.readFileSync(marker));
+			const indexBytes = fs.readFileSync(marker);
+			const list = () => listAsyncRuns(root, { sessionId: "session-a", states: ["complete"], reconcile: false });
+
+			assert.deepEqual(list().map((run) => run.id), ["terminal-good-b", "terminal-good-a"]);
+			assert.deepEqual(list().map((run) => run.id), ["terminal-good-b", "terminal-good-a"]);
+			assert.equal(diagnostics.filter((line) => line.includes("corrupt status")).length, 1);
+			assert.deepEqual(fs.readFileSync(corruptStatus), corruptBytes);
+			assert.deepEqual(fs.readFileSync(marker), indexBytes);
+			assert.deepEqual(fs.readFileSync(aliasMarker), indexBytes);
+			assert.throws(() => listAsyncRuns(root, { runId: "terminal-corrupt", reconcile: false }), /Failed to parse async status file/);
+			assert.deepEqual(fs.readFileSync(corruptStatus), corruptBytes);
+			assert.deepEqual(fs.readFileSync(marker), indexBytes);
+			assert.deepEqual(fs.readFileSync(aliasMarker), indexBytes);
+
+			fs.writeFileSync(corruptStatus, Buffer.alloc(33, 0));
+			const notices: string[] = [];
+			const listed = listAsyncRuns(root, { sessionId: "session-a", states: ["complete"], reconcile: false, onCorruptStatus: (warning) => notices.push(warning) });
+			assert.deepEqual(listed.map((run) => run.id), ["terminal-good-b", "terminal-good-a"]);
+			assert.equal(notices.length, 1);
+			assert.match(notices[0]!, /^Skipping indexed terminal run 'terminal-corrupt' with corrupt status at .*Failed to parse async status file/);
+			assert.equal(diagnostics.filter((line) => line.includes("corrupt status")).length, 1);
+
+			fs.writeFileSync(corruptStatus, JSON.stringify({
+				runId: "terminal-corrupt",
+				sessionId: "session-a",
+				mode: "single",
+				state: "complete",
+				startedAt: 100,
+				endedAt: 200,
+				steps: [{ agent: "worker", status: "complete" }],
+			}));
+			assert.ok(list().some((run) => run.id === "terminal-corrupt"));
+			assert.equal(diagnostics.filter((line) => line.includes("corrupt status")).length, 1);
+		} finally {
+			console.error = originalError;
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
