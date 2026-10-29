@@ -1,7 +1,7 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
-import { Worker } from "node:worker_threads";
+import { createWorkflowScriptWorker } from "./workflow-script-worker.ts";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import { describeGateAcceptanceConflict, parseGateInput } from "../runs/shared/acceptance.ts";
@@ -42,9 +42,6 @@ export interface WorkflowScriptValidationOptions {
 	/** Returns why launch-time resolution would reject this literal child agent name. */
 	agentNameError?: (name: string) => string | undefined;
 }
-
-const WORKFLOW_WORKER_URL = new URL("../../workflow-script-worker.cjs", import.meta.url);
-let nodeWorkerSource: string | undefined;
 
 export interface WorkflowScriptChildResult {
 	key: string;
@@ -1085,15 +1082,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	} catch (error) {
 		throw new WorkflowScriptError("Workflow parser dependency 'acorn' is unavailable from pi-subagents. Reinstall pi-subagents dependencies before launching workflowScript.", emptyPartial(), "runtime", { cause: error });
 	}
-	let worker: Worker;
+	let worker: ReturnType<typeof createWorkflowScriptWorker>;
 	try {
-		const bun = typeof process.versions.bun === "string";
-		// Bun needs a real file as its resolver base on warm transpiler-cache hits, and no eval key at all: with one,
-		// its Worker finalizer passes the URL to URL.revokeObjectURL and throws. Node keeps eval source because its
-		// eval worker does not re-resolve inherited --import preloads after a cwd change.
-		worker = bun
-			? new Worker(WORKFLOW_WORKER_URL, { workerData: { acornPath } })
-			: new Worker(nodeWorkerSource ??= readFileSync(WORKFLOW_WORKER_URL, "utf8"), { eval: true, workerData: { acornPath } });
+		worker = createWorkflowScriptWorker(acornPath);
 	} catch (error) {
 		throw new WorkflowScriptError(`Workflow worker could not start: ${error instanceof Error ? error.message : String(error)}`, emptyPartial(), "runtime", { cause: error });
 	}
@@ -1216,13 +1207,14 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				assemblyFlushTimer = undefined;
 			}
 			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed."));
-			void Promise.allSettled([...steers.values(), ...hostCalls.values()].map(({ promise }) => promise)).then(() => {
+			void Promise.allSettled([...steers.values(), ...hostCalls.values()].map(({ promise }) => promise)).then(async () => {
 				if (settled) return;
 				settled = true;
 				options.registerStopChild?.(undefined);
 				if (timer) clearTimeout(timer);
 				options.signal?.removeEventListener("abort", onAbort);
-				void worker.terminate();
+				const completedPartial = partial();
+				await worker.terminate();
 				const unobservedKeys = "value" in outcome ? [...launches].filter(([, launch]) => !launch.observed).map(([key]) => key) : [];
 				const completionError = unobservedKeys.length > 0
 					? new Error(`workflowScript completed with unawaited runs.run launch(es): ${unobservedKeys.map((key) => `'${key}'`).join(", ")}. For ordinary parallel fanout use await runs.all([{key, agent, task}, ...]); do not read .output from unawaited launches.`)
@@ -1235,9 +1227,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						})()
 						: undefined;
 				// Stops and reloads end through the abort paths untagged: they are not failures.
-				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, partial(), isWorkflowScriptFailureKind(outcome.error.workflowErrorKind) ? outcome.error.workflowErrorKind : undefined));
-				else if (completionError) reject(new WorkflowScriptError(completionError.message, partial(), "validation"));
-				else resolve({ value: outcome.value, ...partial() });
+				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, completedPartial, isWorkflowScriptFailureKind(outcome.error.workflowErrorKind) ? outcome.error.workflowErrorKind : undefined));
+				else if (completionError) reject(new WorkflowScriptError(completionError.message, completedPartial, "validation"));
+				else resolve({ value: outcome.value, ...completedPartial });
 			});
 		};
 		const onAbort = () => {
@@ -1295,7 +1287,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 
 		worker.on("error", (error) => finish({ error: taggedWorkflowError(`Workflow worker failed: ${error instanceof Error ? error.message : String(error)}`, "runtime") }));
 		worker.on("exit", (code) => {
-			if (!settled && code !== 0) finish({ error: taggedWorkflowError(`Workflow worker exited with code ${code}.`, "runtime") });
+			if (!settled && !finishing) finish({ error: taggedWorkflowError(`Workflow worker exited before returning a result (code ${code}).`, "runtime") });
 		});
 		worker.on("message", (message: Record<string, unknown>) => {
 			if (settled) return;
