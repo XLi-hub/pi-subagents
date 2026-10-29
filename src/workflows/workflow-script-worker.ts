@@ -1,6 +1,7 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
@@ -16,8 +17,9 @@ export class WorkflowScriptProcess extends EventEmitter {
 	constructor(acornPath: string) {
 		super();
 		this.child = fork(WORKFLOW_PROCESS_URL, [realpathSync(acornPath)], {
-			// Do not hold the caller's cwd open after settlement while the process exits on Windows.
-			cwd: fileURLToPath(new URL(".", WORKFLOW_PROCESS_URL)),
+			// Under --permission, Node lets worker threads read everything under the process cwd, so the cwd must
+			// hold only public files: acorn's own directory. It also never holds a caller's cwd open on Windows.
+			cwd: dirname(realpathSync(acornPath)),
 			// No inherited execArgv or NODE_OPTIONS. Only the supervisor may create a worker.
 			execArgv: [
 				"--permission", "--allow-worker",

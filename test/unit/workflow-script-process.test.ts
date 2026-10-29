@@ -19,10 +19,13 @@ describe("restricted Node workflow process", { skip: Boolean(process.versions.bu
 	it("denies file writes, unrelated reads, child processes and nested workers outside the vm", { timeout: 10_000 }, async (t) => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "workflow-permission-"));
 		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-		const parser = path.join(root, "parser-probe.cjs");
+		// The process cwd is the parser's directory, which worker threads can read, so keep the probes outside it.
+		fs.mkdirSync(path.join(root, "parser"));
+		const parser = path.join(root, "parser", "parser-probe.cjs");
 		const secret = path.join(root, "outside.txt");
 		const canary = path.join(root, "must-not-write.txt");
 		const supervisor = new URL("../../workflow-script-process.cjs", import.meta.url);
+		const packageManifest = new URL("../../package.json", import.meta.url);
 		fs.writeFileSync(secret, "fixture, not a credential");
 		// A controlled parser fixture runs directly in the real script thread, outside its VM.
 		// This probes the actual launch permissions without needing a VM escape or a second profile.
@@ -32,7 +35,8 @@ describe("restricted Node workflow process", { skip: Boolean(process.versions.bu
 			parentPort.postMessage({
 				read: denied(() => require("node:fs").readFileSync(${JSON.stringify(secret)})),
 				readUrl: denied(() => require("node:fs").readFileSync(new URL(${JSON.stringify(pathToFileURL(secret).href)}))),
-				supervisor: denied(() => require("node:fs").readFileSync(new URL(${JSON.stringify(supervisor.href)}))),
+					supervisor: denied(() => require("node:fs").readFileSync(new URL(${JSON.stringify(supervisor.href)}))),
+					packageManifest: denied(() => require("node:fs").readFileSync(new URL(${JSON.stringify(packageManifest.href)}))),
 				write: denied(() => require("node:fs").writeFileSync(${JSON.stringify(canary)}, "bad")),
 				spawn: denied(() => require("node:child_process").spawnSync(process.execPath, ["-e", ""])),
 				worker: denied(() => new Worker("", { eval: true })),
@@ -41,9 +45,10 @@ describe("restricted Node workflow process", { skip: Boolean(process.versions.bu
 			module.exports.parse = () => ({ type: "Program", body: [] });
 		`);
 		const worker = new WorkflowScriptProcess(parser);
-		t.after(() => worker.terminate());
 		const [proof] = await once(worker, "message");
-		assert.deepEqual(proof, { read: "ERR_ACCESS_DENIED", readUrl: "ERR_ACCESS_DENIED", supervisor: "ALLOWED", write: "ERR_ACCESS_DENIED", spawn: "ERR_ACCESS_DENIED", worker: "ERR_ACCESS_DENIED", inheritedEnvironment: [] });
+		// Windows cannot remove the temp root while the process still runs in it.
+		await worker.terminate();
+		assert.deepEqual(proof, { read: "ERR_ACCESS_DENIED", readUrl: "ERR_ACCESS_DENIED", supervisor: "ALLOWED", packageManifest: "ERR_ACCESS_DENIED", write: "ERR_ACCESS_DENIED", spawn: "ERR_ACCESS_DENIED", worker: "ERR_ACCESS_DENIED", inheritedEnvironment: [] });
 		assert.equal(fs.existsSync(canary), false);
 	});
 
