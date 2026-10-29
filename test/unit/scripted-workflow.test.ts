@@ -2614,7 +2614,8 @@ describe("scripted workflow runtime", () => {
 		let childAborted = false;
 		await assert.rejects(
 			runWorkflowScript({
-				script: `runs.run("bg", { agent: "worker", task: "fire and forget" }); return "done";`,
+				// The status round trip ensures the host has started the launch; a launch still queued at completion is never started.
+				script: `runs.run("bg", { agent: "worker", task: "fire and forget" }); await runs.status("probe"); return "done";`,
 				timeoutMs: 2_000,
 				launch(_key, _params, signal) {
 					return new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
