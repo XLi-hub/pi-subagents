@@ -16,6 +16,8 @@ export class WorkflowScriptProcess extends EventEmitter {
 	constructor(acornPath: string) {
 		super();
 		this.child = fork(WORKFLOW_PROCESS_URL, [realpathSync(acornPath)], {
+			// Do not hold the caller's cwd open after settlement while the process exits on Windows.
+			cwd: fileURLToPath(new URL(".", WORKFLOW_PROCESS_URL)),
 			// No inherited execArgv or NODE_OPTIONS. Only the supervisor may create a worker.
 			execArgv: [
 				"--permission", "--allow-worker",
