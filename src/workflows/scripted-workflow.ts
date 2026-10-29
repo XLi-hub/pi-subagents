@@ -1207,14 +1207,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				assemblyFlushTimer = undefined;
 			}
 			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed."));
-			void Promise.allSettled([...steers.values(), ...hostCalls.values()].map(({ promise }) => promise)).then(async () => {
+			void Promise.allSettled([...steers.values(), ...hostCalls.values()].map(({ promise }) => promise)).then(() => {
 				if (settled) return;
 				settled = true;
 				options.registerStopChild?.(undefined);
 				if (timer) clearTimeout(timer);
 				options.signal?.removeEventListener("abort", onAbort);
-				const completedPartial = partial();
-				await worker.terminate();
+				void worker.terminate();
 				const unobservedKeys = "value" in outcome ? [...launches].filter(([, launch]) => !launch.observed).map(([key]) => key) : [];
 				const completionError = unobservedKeys.length > 0
 					? new Error(`workflowScript completed with unawaited runs.run launch(es): ${unobservedKeys.map((key) => `'${key}'`).join(", ")}. For ordinary parallel fanout use await runs.all([{key, agent, task}, ...]); do not read .output from unawaited launches.`)
@@ -1227,9 +1226,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						})()
 						: undefined;
 				// Stops and reloads end through the abort paths untagged: they are not failures.
-				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, completedPartial, isWorkflowScriptFailureKind(outcome.error.workflowErrorKind) ? outcome.error.workflowErrorKind : undefined));
-				else if (completionError) reject(new WorkflowScriptError(completionError.message, completedPartial, "validation"));
-				else resolve({ value: outcome.value, ...completedPartial });
+				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, partial(), isWorkflowScriptFailureKind(outcome.error.workflowErrorKind) ? outcome.error.workflowErrorKind : undefined));
+				else if (completionError) reject(new WorkflowScriptError(completionError.message, partial(), "validation"));
+				else resolve({ value: outcome.value, ...partial() });
 			});
 		};
 		const onAbort = () => {

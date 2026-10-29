@@ -3,6 +3,11 @@
 const { Worker } = require("node:worker_threads");
 const { join } = require("node:path");
 
+// Windows process creation adds a standard environment even when fork receives an empty one.
+for (const key of Object.keys(process.env)) {
+  if (process.platform !== "win32" || key.toLowerCase() !== "systemroot") delete process.env[key];
+}
+
 // Keep IPC on this thread: a busy workflow must not prevent parent-disconnect cleanup.
 // The script thread has no worker permission; filesystem grants are inherited from the process.
 const worker = new Worker(join(__dirname, "workflow-script-worker.cjs"), {
